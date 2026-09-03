@@ -1,0 +1,38 @@
+# IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Eclipse / VSCode
+.classpath
+.project
+.settings/
+.vscode/
+
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# Vaadin generated frontend
+node_modules/
+frontend/generated/
+package-lock.json
+package.json
+vite.generated.ts
+tsconfig.json
+types.d.ts
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# DevBridge local runtime state — never commit real project data
+.devbridge/
+profiles/
+*.profile.json
+!sample-profile.json

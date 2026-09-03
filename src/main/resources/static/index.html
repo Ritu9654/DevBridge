@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DevBridge</title>
+    <script>
+        // Applied before CSS resolves so there's no flash of light theme.
+        try {
+            var t = localStorage.getItem('devbridge.theme');
+            if (t === 'dark') document.documentElement.dataset.theme = 'dark';
+        } catch (e) { /* localStorage blocked — stay on default */ }
+    </script>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <div class="app">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1 class="brand">DevBridge</h1>
+                <p class="brand-tagline">Dev productivity toolkit</p>
+            </div>
+            <nav class="nav">
+                <a href="#/" class="nav-item" data-route="/">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                    <span>Home</span>
+                </a>
+                <a href="#/profiles" class="nav-item" data-route="/profiles">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                    <span>Project Profiles</span>
+                </a>
+                <a href="#/db-explorer" class="nav-item" data-route="/db-explorer">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 11v6c0 1.66 4 3 9 3s9-1.34 9-3v-6"/></svg>
+                    <span>DB Explorer</span>
+                </a>
+                <a href="#/sql-runner" class="nav-item" data-route="/sql-runner">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                    <span>SQL Runner</span>
+                </a>
+                <a href="#/import-app" class="nav-item" data-route="/import-app">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    <span>Import App</span>
+                </a>
+                <a href="#/delete-app" class="nav-item" data-route="/delete-app">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+                    <span>Delete App</span>
+                </a>
+                <a href="#/settings" class="nav-item" data-route="/settings">
+                    <svg class="nav-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                    <span>Settings</span>
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="active-profile empty" id="active-profile">
+                    <span class="active-profile-label">Active profile</span>
+                    <button class="profile-switcher" id="profile-switcher" type="button" aria-haspopup="true" aria-expanded="false">
+                        <span class="switcher-name" id="switcher-name">None selected</span>
+                        <span class="switcher-chevron" aria-hidden="true">▾</span>
+                    </button>
+                    <div class="switcher-menu hidden" id="switcher-menu" role="menu"></div>
+                </div>
+                <button class="token-status" id="token-status" type="button" title="Click to paste or clear your FAWB auth token">
+                    <span class="token-status-dot"></span>
+                    <span id="token-status-text">Token not set</span>
+                </button>
+                <div class="status" id="status">
+                    <span class="status-dot"></span>
+                    <span id="status-text">Checking backend...</span>
+                </div>
+            </div>
+        </aside>
+        <main class="main">
+            <header class="topbar">
+                <h2 id="view-title">Home</h2>
+                <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">
+                    <svg class="theme-icon theme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="12" cy="12" r="4"/>
+                        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+                    </svg>
+                    <svg class="theme-icon theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                    </svg>
+                </button>
+            </header>
+            <div id="view-container" class="view-container"></div>
+        </main>
+    </div>
+
+    <!-- Toast notifications -->
+    <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- Import execute confirmation modal -->
+    <div class="modal-overlay hidden" id="execute-modal" role="dialog" aria-modal="true" aria-labelledby="execute-modal-title">
+        <div class="modal-panel">
+            <h3 id="execute-modal-title">Confirm import execution</h3>
+            <div class="modal-warn-banner">
+                <strong>⚠ This will write real rows to the target environment.</strong>
+                Auto-rollback runs if the import fails.
+            </div>
+            <dl class="confirm-details">
+                <dt>Profile</dt><dd id="confirm-profile"></dd>
+                <dt>Source → Target</dt><dd id="confirm-envs"></dd>
+                <dt>Target URL</dt><dd><code id="confirm-target-url"></code></dd>
+                <dt>App ID</dt><dd><code id="confirm-appid"></code></dd>
+                <dt>Steps to POST</dt><dd id="confirm-steps"></dd>
+            </dl>
+            <label for="confirm-input" class="modal-label">Type the app id above to confirm:</label>
+            <input type="text" id="confirm-input" class="confirm-input" autocomplete="off" spellcheck="false">
+            <div class="modal-actions">
+                <button class="btn secondary" id="btn-cancel-execute" type="button">Cancel</button>
+                <button class="btn danger" id="btn-do-execute" type="button" disabled>Execute now</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete execute confirmation modal -->
+    <div class="modal-overlay hidden" id="delete-modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+        <div class="modal-panel">
+            <h3 id="delete-modal-title">Confirm app deletion</h3>
+            <div class="modal-warn-banner modal-warn-banner-danger">
+                <strong>⚠ This is IRREVERSIBLE.</strong>
+                Deleted rows cannot be recovered. There is no rollback.
+            </div>
+            <dl class="confirm-details">
+                <dt>Profile</dt><dd id="delete-confirm-profile"></dd>
+                <dt>Env</dt><dd id="delete-confirm-env"></dd>
+                <dt>Target URL</dt><dd><code id="delete-confirm-target-url"></code></dd>
+                <dt>App ID</dt><dd><code id="delete-confirm-appid"></code></dd>
+                <dt>Rows to delete</dt><dd id="delete-confirm-steps"></dd>
+            </dl>
+            <label for="delete-confirm-input" class="modal-label">Type the app id above to confirm:</label>
+            <input type="text" id="delete-confirm-input" class="confirm-input" autocomplete="off" spellcheck="false">
+            <div class="modal-actions">
+                <button class="btn secondary" id="btn-cancel-delete" type="button">Cancel</button>
+                <button class="btn danger" id="btn-do-delete" type="button" disabled>Delete now</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Token paste modal -->
+    <div class="modal-overlay hidden" id="token-modal" role="dialog" aria-modal="true" aria-labelledby="token-modal-title">
+        <div class="modal-panel">
+            <h3 id="token-modal-title">FAWB auth token</h3>
+
+            <!-- Auto-fetch panel — visible when profile has OAuth credentials configured -->
+            <div class="token-fetch-panel hidden" id="token-fetch-panel">
+                <p class="modal-help">
+                    <strong>Auto-fetch</strong> is configured on this profile. Click below to request
+                    a fresh <code>WM_AUTH_TOKEN</code> using the OAuth2 credentials — no paste needed.
+                </p>
+                <div class="modal-actions" style="justify-content:flex-start; margin-top:8px;">
+                    <button class="btn" id="btn-fetch-token" type="button">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 4 21 10 15 10"/>
+                        </svg>
+                        Fetch token now
+                    </button>
+                </div>
+                <hr class="form-divider">
+                <p class="modal-help" style="font-size:12px; color:var(--text-muted);">
+                    Or paste manually below.
+                </p>
+            </div>
+
+            <p id="token-modal-help" class="modal-help">
+                Paste your <code>WM_AUTH_TOKEN</code> from an active FAWB browser session.
+                Stored in browser storage per profile; cleared when the token expires or you clear it.
+            </p>
+            <p class="modal-help" id="token-fetch-hint" style="font-size:12px; color:var(--text-muted);">
+                Tip: set <strong>Token URL</strong>, <strong>Client ID</strong>, and <strong>Client secret</strong> in the profile to enable one-click token fetch.
+            </p>
+            <label for="token-input" class="modal-label">Token</label>
+            <textarea id="token-input" class="token-textarea" placeholder="Paste the bearer token here…" rows="4" spellcheck="false" autocomplete="off"></textarea>
+            <div class="modal-actions">
+                <button class="btn secondary" id="btn-cancel-token" type="button">Cancel</button>
+                <button class="btn secondary" id="btn-clear-token" type="button">Clear stored</button>
+                <button class="btn" id="btn-save-token" type="button">Save token</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/js/main.js"></script>
+</body>
+</html>
