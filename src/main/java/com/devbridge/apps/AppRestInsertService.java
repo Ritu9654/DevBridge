@@ -255,7 +255,7 @@ public class AppRestInsertService {
      * A regular text value that happens to be base64-compatible characters
      * won't be touched because it wouldn't decode to a JSON-starter.
      */
-    private static String maybeDecodeBase64Json(String s) {
+    public static String maybeDecodeBase64Json(String s) {
         if (s == null || s.isEmpty()) return s;
         char first = s.charAt(0);
         if (first == '{' || first == '[' || first == '"') return s;   // already JSON-shaped

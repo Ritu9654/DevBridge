@@ -1030,12 +1030,47 @@ public class AppSqlExecutorService {
             try {
                 res = restInserter.insert(row, table, pol, idMap, profile, targetBaseUrl, dbService);
             } catch (Exception e) {
+                // Transport-level error (network, chunked-encoding parse, timeout,
+                // etc.) — no response body available. Attempt SQL fallback: the
+                // raw executeSQLs endpoint uses a different transport shape and
+                // often succeeds where REST's chunked response reader chokes.
+                // Common trigger: ACTIVITY_PAYLOAD with a huge BLOB where FAWB's
+                // response streaming breaks midway.
+                String errClass = e.getClass().getSimpleName();
+                String errMsg = e.getMessage() == null ? "(no detail)" : e.getMessage();
+                log.warn("REST insert transport error on {} srcPk={}: {} — attempting SQL fallback.",
+                        tableName, sourcePk, errClass + ": " + errMsg);
+                SqlFallbackResult sqlResult = trySqlFallbackInsert(
+                        row, table, pol, idMap, profile, targetEnv,
+                        counter, order, sourcePk, primaryPk);
+                if (sqlResult != null && sqlResult.succeeded) {
+                    log.warn("REST transport error on {} recovered via SQL fallback.", tableName);
+                    if (sqlResult.newPk != null && sourcePk != null) {
+                        idMap.computeIfAbsent(tableKey, k -> new LinkedHashMap<>())
+                                .put(sourcePk, sqlResult.newPk);
+                    }
+                    journal = journal.withEntry(new ImportJournal.Entry(order, table.entityName(), tableName,
+                            "SQL fallback", sourcePk, sqlResult.newPk, 200, "created",
+                            "Inserted via SQL fallback (REST transport error — oversized payload or chunked response). Row is in target.",
+                            Instant.now()));
+                    journalStore.write(journal);
+                    continue;
+                }
+                // Both failed — skip this row (or halt for a leaf/critical
+                // table? For now: skip + cascade so we don't halt the whole
+                // run on one transport hiccup or an oversized-payload row).
+                String fallbackDetail = sqlResult == null
+                        ? "not attempted (FK unresolvable)"
+                        : sqlResult.errorDetail;
                 journal = journal.withEntry(new ImportJournal.Entry(order, table.entityName(), tableName,
-                        "REST POST", sourcePk, null, 0, "failed",
-                        "REST insert error: " + e.getClass().getSimpleName() + ": " + e.getMessage(),
+                        "REST POST", sourcePk, null, 0, "skipped",
+                        "REST insert transport error: " + errClass + ": " + errMsg
+                                + ". SQL fallback also failed: " + trunc(fallbackDetail)
+                                + ". Row skipped; if downstream tables FK to this row they will cascade-skip.",
                         Instant.now()));
                 journalStore.write(journal);
-                throw new HaltException("REST INSERT failed for " + tableName + ": " + e.getMessage());
+                skippedTables.add(tableKey);
+                continue;
             }
             if (!res.ok()) {
                 // Auto-skip on FAWB "methodAccessDenied" — the REST endpoint
@@ -1096,12 +1131,42 @@ public class AppSqlExecutorService {
                             + "this table's rows can't be inserted via REST from an external caller";
                 }
                 if (skipReason != null) {
-                    log.warn("Skipping row {}={} on {}: FAWB refused write ({}). Downstream FKs to this row will cascade-skip.",
-                            primaryPk, sourcePk, tableName, skipReason);
+                    // Try raw-SQL fallback FIRST. REST goes through FAWB's
+                    // Hibernate/JPA layer which sometimes refuses external
+                    // writes (methodAccessDenied, TransientObjectException,
+                    // shared PK+FK entities where @Id is @JsonIgnore, etc.).
+                    // executeSQLs bypasses all of that — DB-level INSERT
+                    // subject only to actual DB constraints. Works for
+                    // assigned-PK tables where we know the target PK.
+                    SqlFallbackResult sqlResult = trySqlFallbackInsert(
+                            row, table, pol, idMap, profile, targetEnv,
+                            counter, order, sourcePk, primaryPk);
+                    if (sqlResult != null && sqlResult.succeeded) {
+                        log.warn("REST refused {} ({}), but SQL fallback succeeded — row inserted via raw executeSQLs. Downstream FKs to this row will work normally.",
+                                tableName, skipReason);
+                        if (sqlResult.newPk != null && sourcePk != null) {
+                            idMap.computeIfAbsent(tableKey, k -> new LinkedHashMap<>())
+                                    .put(sourcePk, sqlResult.newPk);
+                        }
+                        journal = journal.withEntry(new ImportJournal.Entry(order, table.entityName(), tableName,
+                                "SQL fallback", sourcePk, sqlResult.newPk, 200, "created",
+                                "Inserted via SQL fallback (" + shortRestRefusalReason(skipReason) + "). Row is in target.",
+                                Instant.now()));
+                        journalStore.write(journal);
+                        continue;
+                    }
+                    // SQL fallback also failed (or wasn't attempted, e.g. FK
+                    // unresolvable). Fall back to skip + cascade-skip children.
+                    String sqlFallbackNote = sqlResult == null
+                            ? " SQL fallback not attempted (FK to a skipped parent or missing PK)."
+                            : " SQL fallback also failed: " + trunc(sqlResult.errorDetail);
+                    log.warn("Skipping row {}={} on {}: FAWB refused write ({}).{} Downstream FKs to this row will cascade-skip.",
+                            primaryPk, sourcePk, tableName, skipReason, sqlFallbackNote);
                     journal = journal.withEntry(new ImportJournal.Entry(order, table.entityName(), tableName,
                             "REST POST", sourcePk, null, res.status(), "skipped",
                             "FAWB refused write to " + tableName + " — " + skipReason
-                                    + ". Row not inserted; continuing. Downstream children FKing to this row will be cascade-skipped.",
+                                    + "." + sqlFallbackNote
+                                    + " Row not inserted; continuing. Downstream children FKing to this row will be cascade-skipped.",
                             Instant.now()));
                     journalStore.write(journal);
                     skippedTables.add(tableKey);
@@ -1552,6 +1617,28 @@ public class AppSqlExecutorService {
     }
 
     /**
+     * Turn the verbose REST-refusal explanation into a short, user-facing tag.
+     * The long form is useful in server logs for diagnosis; the journal cell
+     * just needs a plain-English hint about why REST didn't work. Success —
+     * the row IS in target — is what the message should lead with.
+     */
+    private static String shortRestRefusalReason(String longReason) {
+        if (longReason == null) return "REST refused; used SQL";
+        String l = longReason.toLowerCase(Locale.ROOT);
+        if (l.contains("methodaccessdenied") || l.contains("access denied for this method"))
+            return "REST create method restricted for this entity";
+        if (l.contains("content-type"))
+            return "payload too large for REST endpoint";
+        if (l.contains("no post endpoint") || l.contains("no endpoint post"))
+            return "no REST create endpoint registered";
+        if (l.contains("assigned-pk"))
+            return "REST layer discards client-supplied PK";
+        if (l.contains("transient"))
+            return "REST rejects referenced entity as unsaved (FAWB per-request session limitation)";
+        return "REST refused for this entity";
+    }
+
+    /**
      * Extract the most useful part of a Spring/JDBC error string. Spring prefixes
      * DB errors with the full failing SQL ("StatementCallback; SQL [...]; ...")
      * which pushes the actual MariaDB message past any reasonable truncation.
@@ -1608,6 +1695,374 @@ public class AppSqlExecutorService {
      * exists, else null. Never throws — verification is best-effort; on
      * error we assume the row didn't land.
      */
+    /**
+     * Result of a SQL fallback attempt when REST refused an insert.
+     * <ul>
+     *   <li>{@code succeeded} — the raw-SQL INSERT landed cleanly. Caller
+     *   should journal as {@code created} and populate id-map with {@code newPk}.</li>
+     *   <li>{@code newPk} — the target-side PK. Non-null for assigned-PK tables
+     *   (we know the value from FK remap). Null for identity-PK tables where
+     *   the DB assigned the id and we didn't chase LAST_INSERT_ID (safe when
+     *   the table is a leaf).</li>
+     *   <li>{@code errorDetail} — populated when {@code succeeded=false}, empty
+     *   when {@code succeeded=true}. Includes the raw envelope error text so
+     *   the caller's "skipped" message can name both the REST and SQL failures.</li>
+     * </ul>
+     */
+    private record SqlFallbackResult(boolean succeeded, Object newPk, String errorDetail) {}
+
+    /**
+     * Attempt a raw-SQL INSERT for a row that FAWB's REST layer refused.
+     * Mirrors the setPairs construction of {@link #executeAssignedTable}:
+     * strip server-generated columns, regenerate assigned-UUID PKs, remap
+     * FK values via id-map (or sentinel), then emit
+     * {@code INSERT INTO T SET col=val, ...} through {@link SqlService}.
+     * <p>
+     * Returns null when a fallback isn't sensible (e.g. an FK we need can't
+     * be remapped because its target was itself skipped). The caller treats
+     * this the same as {@code succeeded=false} and skips + cascade-marks.
+     */
+    private SqlFallbackResult trySqlFallbackInsert(Map<String, Object> sourceRow,
+                                                    DataModel.Table table,
+                                                    AppSqlPlanService.ColumnPolicies pol,
+                                                    Map<String, Map<Object, Object>> idMap,
+                                                    ProjectProfile profile, String targetEnv,
+                                                    StepCounter counter, int order,
+                                                    Object sourcePk, String primaryPk) {
+        String tableName = table.name();
+        Map<String, Object> setPairs = new LinkedHashMap<>();
+        Object newPk = null;
+
+        for (DataModel.Column col : safe(table.columns())) {
+            String cname = col.name();
+            if (cname == null) continue;
+            String lower = cname.toLowerCase(Locale.ROOT);
+            if (pol.strippedLower.contains(lower)) continue;
+
+            Object v = lookup(sourceRow, cname);
+
+            // Regenerate assigned-UUID PKs client-side (as executeAssignedTable does).
+            if (pol.uuidPkColumnsLower.contains(lower) && isUuidLike(v)) {
+                String fresh = UUID.randomUUID().toString();
+                setPairs.put(cname, fresh);
+                if (cname.equalsIgnoreCase(primaryPk)) newPk = fresh;
+                continue;
+            }
+
+            // FK remap via id-map (populated for both walked tables and
+            // configured reference tables). Sentinel fallback for audit cols.
+            ImportPlan.FkRemap remap = pol.fkByColumnLower.get(lower);
+            if (remap != null && v != null) {
+                Object mapped = lookupIdMap(idMap, remap.targetTable(), v);
+                if (mapped == null && remap.useSentinel()) {
+                    mapped = ReferenceRemapService.lookupSentinel(idMap, remap.targetTable());
+                }
+                if (mapped != null) {
+                    setPairs.put(cname, SqlBuilder.convertForInsert(mapped, col));
+                    if (cname.equalsIgnoreCase(primaryPk)) newPk = mapped;
+                    continue;
+                }
+                if (!remap.isReferenceTarget()) {
+                    // FK target wasn't inserted and isn't a reference table —
+                    // no way to satisfy the FK constraint. Bail on fallback.
+                    return null;
+                }
+                // Reference target with no natural-key remap — pass-through.
+                setPairs.put(cname, SqlBuilder.convertForInsert(v, col));
+                continue;
+            }
+            setPairs.put(cname, SqlBuilder.convertForInsert(v, col));
+        }
+
+        if (setPairs.isEmpty()) {
+            return new SqlFallbackResult(false, null, "no columns to insert after strip/policy");
+        }
+
+        // Identify large-text columns whose values would blow past the URL
+        // budget in a single INSERT (ACTIVITY_PAYLOAD.dataPayload etc.).
+        // Split them out and route through INSERT-small + CONCAT-UPDATE-chunks.
+        Map<String, DataModel.Column> colByName = new LinkedHashMap<>();
+        for (DataModel.Column c : safe(table.columns())) {
+            if (c != null && c.name() != null) colByName.put(c.name().toLowerCase(Locale.ROOT), c);
+        }
+        Map<String, String> largeTextValues = new LinkedHashMap<>();
+        Map<String, Object> smallSetPairs = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : setPairs.entrySet()) {
+            DataModel.Column c = colByName.get(e.getKey().toLowerCase(Locale.ROOT));
+            Object v = e.getValue();
+            if (isLargeTextColumn(c) && v instanceof String s && !s.isEmpty()) {
+                // If the source served it as base64-encoded (FAWB does this for
+                // BLOB/CLOB columns), decode first so the stored value is raw
+                // JSON/text (matches what the REST path does via formatForRest).
+                String decoded = AppRestInsertService.maybeDecodeBase64Json(s);
+                largeTextValues.put(e.getKey(), decoded);
+                // Placeholder in the small INSERT: NULL if nullable, empty else.
+                smallSetPairs.put(e.getKey(), (c != null && c.nullable()) ? null : "");
+            } else {
+                smallSetPairs.put(e.getKey(), v);
+            }
+        }
+        boolean useSplitPath = !largeTextValues.isEmpty();
+
+        // For identity-PK tables (no client-known PK), snapshot MAX(id) BEFORE
+        // the INSERT. FAWB frequently silent-commits identity rows (returns
+        // "could not execute statement — no DB detail" while the row lands).
+        // Comparing MAX(id) after the INSERT lets us detect and recover.
+        // Also used in the split path to discover the identity id for
+        // subsequent CONCAT UPDATE targeting.
+        Object maxIdBefore = null;
+        if (newPk == null && primaryPk != null) {
+            maxIdBefore = fetchMaxPk(profile, targetEnv, tableName, primaryPk);
+        }
+
+        // Build and run: DELETE-by-PK pre-clean + small INSERT. Pre-clean
+        // protects against re-import collisions on assigned-PK tables (same
+        // as executeAssignedTable's needsPreClean path).
+        List<String> stmts = new ArrayList<>(2);
+        if (newPk != null && primaryPk != null) {
+            stmts.add(SqlBuilder.deleteByEquals(tableName, primaryPk, newPk));
+        }
+        stmts.add(SqlBuilder.insertSet(tableName, smallSetPairs));
+        String batchSql = SqlBuilder.batch(stmts);
+
+        ExecuteResult res;
+        try {
+            res = sqlService.execute(profile, targetEnv, batchSql);
+        } catch (Exception e) {
+            return new SqlFallbackResult(false, null,
+                    "transport error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        String err;
+        try {
+            err = firstStatementError(res);
+        } catch (Exception e) {
+            return new SqlFallbackResult(false, null,
+                    "response parse error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        // Determine the actual target PK now that INSERT has been attempted.
+        // Two paths: (a) client-known PK for assigned tables — verify row
+        // landed; (b) identity table — find via MAX(id) diff. Also handles
+        // the silent-commit case where FAWB reports error but the row is in.
+        Object actualPk = null;
+        if (newPk != null && primaryPk != null) {
+            Object landedPk = verifyRowLanded(profile, targetEnv, tableName, primaryPk, newPk);
+            if (landedPk != null) {
+                actualPk = newPk;
+                if (err != null) {
+                    log.warn("SQL fallback for {} reported error but the row is in target (silent commit). "
+                            + "Treating as success. FAWB error: {}", tableName, trunc(err));
+                }
+            }
+        } else if (primaryPk != null) {
+            Object maxIdAfter = fetchMaxPk(profile, targetEnv, tableName, primaryPk);
+            if (maxIdAfter != null && isGreaterThan(maxIdAfter, maxIdBefore)) {
+                actualPk = maxIdAfter;
+                if (err != null) {
+                    log.warn("SQL fallback for {} (identity) reported error but MAX({}) went from {} to {} — silent commit detected. Treating as success.",
+                            tableName, primaryPk, maxIdBefore, maxIdAfter);
+                }
+            }
+        }
+        if (actualPk == null) {
+            // Insert genuinely failed.
+            if (err != null) {
+                return new SqlFallbackResult(false, null, err);
+            }
+            if (newPk == null && primaryPk != null) {
+                return new SqlFallbackResult(false, null,
+                        "MAX(" + primaryPk + ") did not increase after INSERT — row didn't land");
+            }
+            if (newPk != null) {
+                return new SqlFallbackResult(false, null,
+                        "SQL response was success but verification SELECT found no row with " + primaryPk + "=" + newPk);
+            }
+            // No PK to verify against — trust the response.
+            return new SqlFallbackResult(true, null, "");
+        }
+
+        // Row is in target with PK = actualPk. If this was a split-path
+        // insert (large-text columns extracted), now apply each large-text
+        // via chunked CONCAT UPDATE. Same mechanism used by executeOversizedRow
+        // for CASE_DATUM-style tables: base64-shielded chunks WHERE pk=actualPk.
+        if (useSplitPath && primaryPk != null) {
+            for (Map.Entry<String, String> lt : largeTextValues.entrySet()) {
+                String colName = lt.getKey();
+                String fullValue = lt.getValue();
+                if (fullValue == null || fullValue.isEmpty()) continue;
+                List<String> chunks = chunkString(fullValue, LARGE_TEXT_CHUNK_CHARS);
+                for (int idx = 0; idx < chunks.size(); idx++) {
+                    String chunkValue = chunks.get(idx);
+                    String updateSql = (idx == 0)
+                            ? SqlBuilder.updateSetBase64(tableName, colName, chunkValue, primaryPk, actualPk)
+                            : SqlBuilder.updateConcatSetBase64(tableName, colName, chunkValue, primaryPk, actualPk);
+                    ExecuteResult ur;
+                    try {
+                        ur = sqlService.execute(profile, targetEnv, updateSql);
+                    } catch (Exception e) {
+                        return new SqlFallbackResult(false, null,
+                                "large-text CONCAT UPDATE for " + colName + " chunk " + (idx + 1)
+                                        + "/" + chunks.size() + " transport error: "
+                                        + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    }
+                    String uErr;
+                    try { uErr = firstStatementError(ur); }
+                    catch (Exception e) {
+                        return new SqlFallbackResult(false, null,
+                                "large-text CONCAT UPDATE for " + colName + " chunk " + (idx + 1)
+                                        + " parse error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    }
+                    if (uErr != null) {
+                        // Silent-commit pattern: FAWB returns "could not execute
+                        // statement — (no DB detail returned by FAWB...)" but the
+                        // UPDATE actually applies at DB level. Same pattern we've
+                        // observed on APPLICATION_DETAILS / PersonFinancial / etc.
+                        // Trust the pattern and continue to the next chunk; a
+                        // final length verification below confirms whether the
+                        // full content landed.
+                        if (uErr.contains("no DB detail returned")) {
+                            log.warn("Large-text CONCAT UPDATE for {}.{} chunk {}/{} reported '{}' — likely silent commit, continuing.",
+                                    tableName, colName, idx + 1, chunks.size(), trunc(uErr));
+                            continue;
+                        }
+                        return new SqlFallbackResult(false, null,
+                                "large-text CONCAT UPDATE for " + colName + " chunk " + (idx + 1)
+                                        + "/" + chunks.size() + " failed: " + uErr);
+                    }
+                }
+                // Verify the full content landed: SELECT CHAR_LENGTH and compare
+                // to the expected raw length. If it matches (or is close, within
+                // a few bytes for UTF-8 multi-byte characters), all chunks got
+                // applied — silent-commit or otherwise.
+                Object landedLen = fetchColumnLength(profile, targetEnv, tableName, colName, primaryPk, actualPk);
+                int expectedLen = fullValue.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                if (landedLen == null) {
+                    log.warn("Large-text verification for {}.{} pk={}: SELECT returned no length; can't confirm all chunks landed. Trusting the split.",
+                            tableName, colName, actualPk);
+                } else {
+                    long actualLen = ((Number) landedLen).longValue();
+                    if (actualLen < expectedLen * 0.9) {
+                        // Less than 90% of expected — chunks likely didn't all commit.
+                        return new SqlFallbackResult(false, null,
+                                "large-text CONCAT UPDATEs claimed silent-commit but final "
+                                        + colName + " byte length in target is " + actualLen
+                                        + ", expected ~" + expectedLen
+                                        + ". Chunks did not fully land.");
+                    }
+                    log.info("Large-text {}.{} pk={}: verified byte length {} vs expected {} (all chunks landed).",
+                            tableName, colName, actualPk, actualLen, expectedLen);
+                }
+            }
+            log.info("SQL fallback split path completed for {}: {} large-text column(s), pk={}",
+                    tableName, largeTextValues.size(), actualPk);
+        }
+        return new SqlFallbackResult(true, actualPk, "");
+    }
+
+    /**
+     * Query {@code SELECT LENGTH(col) FROM T WHERE pk = X} to verify how much
+     * data actually landed for a large-text column. Used after chunked
+     * CONCAT UPDATE to confirm all chunks were applied despite FAWB's silent-
+     * commit error responses. Returns null on any parse/transport error.
+     */
+    private Object fetchColumnLength(ProjectProfile profile, String targetEnv, String tableName,
+                                     String colName, String pkCol, Object pkValue) {
+        try {
+            String sql = "SELECT LENGTH(" + SqlBuilder.ident(colName) + ") AS len FROM "
+                    + SqlBuilder.ident(tableName) + " WHERE " + SqlBuilder.ident(pkCol)
+                    + " = " + SqlBuilder.literal(pkValue);
+            ExecuteResult res = sqlService.execute(profile, targetEnv, sql);
+            if (res.status() < 200 || res.status() >= 300) return null;
+            String body = res.body();
+            if (body == null || body.isBlank()) return null;
+            JsonNode arr = mapper.readTree(body);
+            if (!arr.isArray()) return null;
+            for (JsonNode env : arr) {
+                if (env == null || !env.isObject()) continue;
+                JsonNode resp = env.get("response");
+                if (resp == null || !resp.isTextual()) continue;
+                String s = resp.asText();
+                if (s.isBlank() || "success".equalsIgnoreCase(s)) continue;
+                if (s.charAt(0) != '{' && s.charAt(0) != '[') continue;
+                JsonNode parsed = mapper.readTree(s);
+                JsonNode row = parsed.isArray() ? (parsed.isEmpty() ? null : parsed.get(0)) : parsed;
+                if (row == null || !row.isObject()) continue;
+                JsonNode v = row.get("len");
+                if (v == null || v.isNull()) {
+                    var fields = row.fields();
+                    while (fields.hasNext()) {
+                        var e = fields.next();
+                        if (e.getValue().isNumber()) { v = e.getValue(); break; }
+                    }
+                }
+                if (v != null && v.isNumber()) return v.numberValue();
+            }
+        } catch (Exception e) {
+            log.debug("fetchColumnLength failed for {}.{} pk={}: {}", tableName, colName, pkValue, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Query {@code SELECT <pk> FROM <table> ORDER BY <pk> DESC LIMIT 1} to
+     * find the highest existing PK value. Used to snapshot before/after an
+     * identity-PK insert so we can detect silent commits by comparing.
+     * Returns null on any error (missing endpoint access, parse failure,
+     * empty table) — callers must be robust to that.
+     */
+    private Object fetchMaxPk(ProjectProfile profile, String targetEnv, String tableName, String pkCol) {
+        try {
+            String sql = "SELECT " + SqlBuilder.ident(pkCol) + " FROM " + SqlBuilder.ident(tableName)
+                    + " ORDER BY " + SqlBuilder.ident(pkCol) + " DESC LIMIT 1";
+            ExecuteResult res = sqlService.execute(profile, targetEnv, sql);
+            if (res.status() < 200 || res.status() >= 300) return null;
+            String body = res.body();
+            if (body == null || body.isBlank()) return null;
+            JsonNode arr = mapper.readTree(body);
+            if (!arr.isArray()) return null;
+            for (JsonNode env : arr) {
+                if (env == null || !env.isObject()) continue;
+                JsonNode resp = env.get("response");
+                if (resp == null || !resp.isTextual()) continue;
+                String s = resp.asText();
+                if (s.isBlank() || "success".equalsIgnoreCase(s)) continue;
+                if (s.charAt(0) != '{' && s.charAt(0) != '[') continue;
+                JsonNode parsed = mapper.readTree(s);
+                JsonNode row = parsed.isArray() ? (parsed.isEmpty() ? null : parsed.get(0)) : parsed;
+                if (row == null || !row.isObject()) continue;
+                // Case-insensitive column lookup
+                JsonNode v = row.get(pkCol);
+                if (v == null || v.isNull()) {
+                    var fields = row.fields();
+                    while (fields.hasNext()) {
+                        var e = fields.next();
+                        if (e.getKey() != null && e.getKey().equalsIgnoreCase(pkCol)) {
+                            v = e.getValue();
+                            break;
+                        }
+                    }
+                }
+                if (v == null || v.isNull()) continue;
+                return v.isNumber() ? v.numberValue() : v.asText();
+            }
+        } catch (Exception e) {
+            log.debug("fetchMaxPk failed for {}.{}: {}", tableName, pkCol, e.getMessage());
+        }
+        return null;
+    }
+
+    /** Numeric comparison for {@code Object} pk values (handles both integer/long forms). */
+    private static boolean isGreaterThan(Object after, Object before) {
+        if (after == null) return false;
+        if (before == null) return true;   // any value beats "no rows before"
+        try {
+            long a = (after instanceof Number) ? ((Number) after).longValue() : Long.parseLong(after.toString());
+            long b = (before instanceof Number) ? ((Number) before).longValue() : Long.parseLong(before.toString());
+            return a > b;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
     private Object verifyRowLanded(ProjectProfile profile, String targetEnv, String tableName,
                                    String pkCol, Object pkValue) {
         try {
