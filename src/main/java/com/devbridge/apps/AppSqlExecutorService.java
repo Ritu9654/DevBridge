@@ -1023,12 +1023,109 @@ public class AppSqlExecutorService {
             }
         }
 
+        // ---- PERF: parallel-prefetch REST POSTs ----
+        // FAWB's per-entity CRUD endpoint has no batch support, so we can't
+        // combine INSERTs into a single call. But independent rows within
+        // one table can be POSTed concurrently — cuts wall-time by the
+        // concurrency factor. We keep the existing per-row processing loop
+        // sequential (safest for id-map updates + journal ordering + all the
+        // error-recovery branching) and just pre-fetch HTTP results into
+        // futures. When the loop below needs a row's result, it either
+        // grabs the pre-fetched future (parallel path) or calls
+        // restInserter.insert() directly (serial fallback).
+        //
+        // Serial fallback triggers when:
+        //   - table has FKs back to itself (later rows may need earlier rows'
+        //     new PKs in idMap — parallel prefetch can't guarantee ordering)
+        //   - only 0 or 1 row to insert (no gain from parallelism)
+        boolean selfReferencing = false;
+        for (ImportPlan.FkRemap remap : pol.fkByColumnLower.values()) {
+            if (FkGraph.norm(remap.targetTable()).equals(tableKey)) {
+                selfReferencing = true; break;
+            }
+        }
+
+        // Pre-compute deterministic per-row values BEFORE submitting workers
+        // so workers can call trySqlFallbackInsert with the right order value
+        // (matching what the sequential collector will use). counter.next()
+        // must run sequentially to preserve numbering across tables.
+        final java.util.List<Integer> orderList = new java.util.ArrayList<>(rows.size());
+        final java.util.List<Object> sourcePkList = new java.util.ArrayList<>(rows.size());
         for (Map<String, Object> row : rows) {
-            int order = counter.next();
-            Object sourcePk = primaryPk != null ? lookupRowValue(row, primaryPk) : null;
+            orderList.add(counter.next());
+            sourcePkList.add(primaryPk != null ? lookupRowValue(row, primaryPk) : null);
+        }
+
+        java.util.concurrent.ExecutorService restPool = null;
+        java.util.List<java.util.concurrent.Future<RestAttempt>> restFutures = null;
+        if (!selfReferencing && rows.size() > 1) {
+            // Pre-create this table's id-map slot so workers reading idMap
+            // (for FK remaps of parent tables) don't race with the sequential
+            // collector adding entries to this same table's inner map.
+            idMap.computeIfAbsent(tableKey, k -> new LinkedHashMap<>());
+            int nThreads = Math.min(6, rows.size());
+            // Daemon threads: if the executor loop throws before we can call
+            // shutdownNow(), the JVM still exits cleanly.
+            final java.util.concurrent.atomic.AtomicInteger tid = new java.util.concurrent.atomic.AtomicInteger();
+            restPool = java.util.concurrent.Executors.newFixedThreadPool(nThreads, r -> {
+                Thread t = new Thread(r, "devbridge-import-rest-" + tid.incrementAndGet());
+                t.setDaemon(true);
+                return t;
+            });
+            restFutures = new java.util.ArrayList<>(rows.size());
+            for (int i = 0; i < rows.size(); i++) {
+                final Map<String, Object> r = rows.get(i);
+                final int rowOrder = orderList.get(i);
+                final Object rowSrcPk = sourcePkList.get(i);
+                restFutures.add(restPool.submit(() -> {
+                    // Try REST first (fast — the network is the only bottleneck)
+                    AppRestInsertService.InsertResult restRes = null;
+                    Exception restErr = null;
+                    try {
+                        restRes = restInserter.insert(r, table, pol, idMap,
+                                profile, targetBaseUrl, dbService);
+                    } catch (Exception ex) {
+                        restErr = ex;
+                    }
+                    // If REST didn't succeed, eagerly run SQL fallback IN THIS
+                    // WORKER THREAD. Critical for tables where every row falls
+                    // through (AUDITDATACHANGE with methodAccessDenied,
+                    // ACTIVITY_PAYLOAD with content-type / oversized): otherwise
+                    // the sequential collector would fire N slow SQL fallbacks
+                    // one after the other, wiping out the parallel-REST gains.
+                    SqlFallbackResult sqlRes = null;
+                    if (restErr != null || (restRes != null && !restRes.ok())) {
+                        try {
+                            sqlRes = trySqlFallbackInsert(r, table, pol, idMap,
+                                    profile, targetEnv, null, rowOrder, rowSrcPk, primaryPk);
+                        } catch (Exception ignore) {
+                            // Fallback threw — collector will observe null sqlRes
+                            // and either try again in the serial path or report failure
+                        }
+                    }
+                    return new RestAttempt(restRes, restErr, sqlRes);
+                }));
+            }
+            restPool.shutdown();
+            log.info("REST+SQL parallel prefetch: {} rows across {} thread(s) for {}",
+                    rows.size(), nThreads, tableName);
+        }
+        try {
+        for (int rowIdx = 0; rowIdx < rows.size(); rowIdx++) {
+            Map<String, Object> row = rows.get(rowIdx);
+            int order = orderList.get(rowIdx);
+            Object sourcePk = sourcePkList.get(rowIdx);
+            // Pre-fetched attempt from the worker (if parallel path was taken).
+            // Includes an eagerly-computed SQL fallback result when REST failed.
+            RestAttempt currentAttempt = (restFutures != null) ? restFutures.get(rowIdx).get() : null;
             AppRestInsertService.InsertResult res;
             try {
-                res = restInserter.insert(row, table, pol, idMap, profile, targetBaseUrl, dbService);
+                if (currentAttempt != null) {
+                    if (currentAttempt.exception != null) throw currentAttempt.exception;
+                    res = currentAttempt.result;
+                } else {
+                    res = restInserter.insert(row, table, pol, idMap, profile, targetBaseUrl, dbService);
+                }
             } catch (Exception e) {
                 // Transport-level error (network, chunked-encoding parse, timeout,
                 // etc.) — no response body available. Attempt SQL fallback: the
@@ -1040,9 +1137,13 @@ public class AppSqlExecutorService {
                 String errMsg = e.getMessage() == null ? "(no detail)" : e.getMessage();
                 log.warn("REST insert transport error on {} srcPk={}: {} — attempting SQL fallback.",
                         tableName, sourcePk, errClass + ": " + errMsg);
-                SqlFallbackResult sqlResult = trySqlFallbackInsert(
-                        row, table, pol, idMap, profile, targetEnv,
-                        counter, order, sourcePk, primaryPk);
+                // Reuse the worker's pre-computed SQL fallback result if it
+                // already ran (parallel path). Otherwise (serial fallback
+                // path, e.g., self-referencing tables), do it inline.
+                SqlFallbackResult sqlResult = (currentAttempt != null && currentAttempt.sqlResult != null)
+                        ? currentAttempt.sqlResult
+                        : trySqlFallbackInsert(row, table, pol, idMap, profile, targetEnv,
+                                counter, order, sourcePk, primaryPk);
                 if (sqlResult != null && sqlResult.succeeded) {
                     log.warn("REST transport error on {} recovered via SQL fallback.", tableName);
                     if (sqlResult.newPk != null && sourcePk != null) {
@@ -1138,9 +1239,14 @@ public class AppSqlExecutorService {
                     // executeSQLs bypasses all of that — DB-level INSERT
                     // subject only to actual DB constraints. Works for
                     // assigned-PK tables where we know the target PK.
-                    SqlFallbackResult sqlResult = trySqlFallbackInsert(
-                            row, table, pol, idMap, profile, targetEnv,
-                            counter, order, sourcePk, primaryPk);
+                    // Reuse the worker's pre-computed SQL fallback result if
+                    // the parallel path already ran it — huge time saver for
+                    // tables where every row goes through this branch
+                    // (AUDITDATACHANGE with methodAccessDenied, etc.).
+                    SqlFallbackResult sqlResult = (currentAttempt != null && currentAttempt.sqlResult != null)
+                            ? currentAttempt.sqlResult
+                            : trySqlFallbackInsert(row, table, pol, idMap, profile, targetEnv,
+                                    counter, order, sourcePk, primaryPk);
                     if (sqlResult != null && sqlResult.succeeded) {
                         log.warn("REST refused {} ({}), but SQL fallback succeeded — row inserted via raw executeSQLs. Downstream FKs to this row will work normally.",
                                 tableName, skipReason);
@@ -1221,8 +1327,27 @@ public class AppSqlExecutorService {
                     Instant.now()));
             journalStore.write(journal);
         }
+        } finally {
+            // Cleanup runs on every exit path (normal completion, HaltException,
+            // or any other throw). shutdownNow() interrupts any workers still
+            // running so we don't leak threads.
+            if (restPool != null) restPool.shutdownNow();
+        }
         return journal;
     }
+
+    /**
+     * Captured outcome of one background REST + SQL-fallback attempt. If REST
+     * succeeded, {@code result.ok()} is true and {@code sqlResult} is null.
+     * If REST failed (exception or non-2xx), the worker also ran
+     * {@link #trySqlFallbackInsert} in parallel and stashed the outcome in
+     * {@code sqlResult} so the sequential collector can reuse it.
+     */
+    private record RestAttempt(
+            AppRestInsertService.InsertResult result,
+            Exception exception,
+            SqlFallbackResult sqlResult
+    ) {}
 
     /**
      * Write the exact outgoing payload to disk so we can replay it manually via
@@ -1843,15 +1968,24 @@ public class AppSqlExecutorService {
         // Two paths: (a) client-known PK for assigned tables — verify row
         // landed; (b) identity table — find via MAX(id) diff. Also handles
         // the silent-commit case where FAWB reports error but the row is in.
+        //
+        // Perf: for assigned-PK tables (a), only run the verify SELECT when
+        // there's an error signal to investigate. Clean responses are trusted
+        // and we skip an entire round-trip per row (~1-2s each). If FAWB ever
+        // silently drops an assigned-PK row without erroring — rare enough
+        // that we haven't seen it — downstream FK failures would surface it.
         Object actualPk = null;
         if (newPk != null && primaryPk != null) {
-            Object landedPk = verifyRowLanded(profile, targetEnv, tableName, primaryPk, newPk);
-            if (landedPk != null) {
-                actualPk = newPk;
-                if (err != null) {
+            if (err != null) {
+                Object landedPk = verifyRowLanded(profile, targetEnv, tableName, primaryPk, newPk);
+                if (landedPk != null) {
+                    actualPk = newPk;
                     log.warn("SQL fallback for {} reported error but the row is in target (silent commit). "
                             + "Treating as success. FAWB error: {}", tableName, trunc(err));
                 }
+            } else {
+                // Clean response — trust it. Skip the verify probe.
+                actualPk = newPk;
             }
         } else if (primaryPk != null) {
             Object maxIdAfter = fetchMaxPk(profile, targetEnv, tableName, primaryPk);

@@ -40,6 +40,37 @@ public class ImportJournalStore {
     }
 
     /**
+     * Read the most-recent (by filename timestamp) import journal for the given
+     * profile. Used by the frontend to poll live progress while an import is
+     * running — the file is rewritten after each row so we always see the
+     * current state within one poll interval.
+     *
+     * <p>Returns {@link java.util.Optional#empty()} if no journals exist for
+     * this profile or the file can't be read.
+     */
+    public java.util.Optional<ImportJournal> readLatest(String profileId) {
+        if (profileId == null || profileId.isBlank()) return java.util.Optional.empty();
+        Path dir = root.resolve(profileId);
+        if (!Files.isDirectory(dir)) return java.util.Optional.empty();
+        try (var stream = Files.list(dir)) {
+            return stream
+                    .filter(p -> p.getFileName().toString().endsWith(".json"))
+                    .max(java.util.Comparator.comparing(p -> p.getFileName().toString()))
+                    .flatMap(p -> {
+                        try {
+                            return java.util.Optional.of(mapper.readValue(p.toFile(), ImportJournal.class));
+                        } catch (IOException e) {
+                            log.debug("Failed to read journal {}: {}", p, e.getMessage());
+                            return java.util.Optional.empty();
+                        }
+                    });
+        } catch (IOException e) {
+            log.debug("Failed to list journals for {}: {}", profileId, e.getMessage());
+            return java.util.Optional.empty();
+        }
+    }
+
+    /**
      * Write (or overwrite) the given journal to its per-profile file. Returns the
      * absolute path so callers can log or surface it in responses.
      */

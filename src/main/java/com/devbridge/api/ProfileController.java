@@ -71,4 +71,30 @@ public class ProfileController {
                 .map(profile -> ResponseEntity.ok(testConnectionService.test(profile)))
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
+
+    /**
+     * Stateless test-connection: the client sends the full profile in
+     * the body. Server does the network probe but doesn't need to have
+     * the profile stored on disk. This is the path used after profiles
+     * moved to localStorage.
+     */
+    @PostMapping("/test-connection")
+    public List<TestConnectionResult> testConnectionByBody(@RequestBody TestConnectionRequest req) {
+        return testConnectionService.test(req.profile());
+    }
+
+    public record TestConnectionRequest(ProjectProfile profile) {}
+
+    /**
+     * Legacy on-disk profiles export for one-time client migration to
+     * browser localStorage. Read-only, never modifies anything. New
+     * profiles created after the localStorage cutover will never appear
+     * here. Client calls this on first boot when its localStorage is
+     * empty; if this endpoint returns a non-empty array, it copies them
+     * in and never asks again.
+     */
+    @GetMapping("/legacy-export")
+    public List<ProjectProfile> legacyExport() {
+        return service.list();
+    }
 }

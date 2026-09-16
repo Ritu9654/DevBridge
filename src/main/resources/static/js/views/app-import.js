@@ -1,4 +1,4 @@
-import { planImport, executeImport, getActiveProfile } from '../api.js';
+import { planImport, executeImport, getActiveProfile, getLatestImportJournal } from '../api.js';
 
 const state = {
     profile: null,
@@ -47,9 +47,10 @@ export const appImportView = {
                 </div>
                 <p class="form-help" id="fetch-help"></p>
                 <p class="form-help">
-                    <strong>Auto-cleanup:</strong> before insert, the tool deletes any existing instance
-                    of this app in the target env (using the same lookup key). Recommended lookup:
-                    <em>Application Number</em> — stable across environments.
+                    <strong>Note:</strong> if the app already exists in the target environment,
+                    the import will be refused. Delete the existing instance via the
+                    <a href="#/delete-app">Delete App</a> section first, then re-run the import.
+                    Recommended lookup: <em>Application Number</em> — stable across environments.
                 </p>
             </div>
 
@@ -162,17 +163,29 @@ async function doPlan() {
     const started = Date.now();
     try {
         const plan = await planImport({ appId, lookupColumn, sourceEnv, targetEnv });
-        const elapsed = Date.now() - started;
+        const elapsed = formatDuration(Date.now() - started);
         if (!plan || plan.totalTables === 0) {
-            showStatus(`Plan returned 0 tables in ${elapsed} ms — see notes below.`, 'error');
+            showStatus(`Plan returned 0 tables in ${elapsed} — see notes below.`, 'error');
         } else {
             const w = (plan.warnings && plan.warnings.length) || 0;
             const warnPart = w > 0 ? ` (${w} note${w === 1 ? '' : 's'})` : '';
-            showStatus(`Plan built — ${plan.totalTables} table${plan.totalTables === 1 ? '' : 's'}, ${plan.totalRows} row${plan.totalRows === 1 ? '' : 's'} in ${elapsed} ms${warnPart}. No writes performed.`, 'success');
+            showStatus(`Plan built — ${plan.totalTables} table${plan.totalTables === 1 ? '' : 's'}, ${plan.totalRows} row${plan.totalRows === 1 ? '' : 's'} in ${elapsed}${warnPart}. No writes performed.`, 'success');
         }
         renderPlan(plan);
     } catch (err) {
-        showStatus(`Plan failed: ${err.message}`, 'error');
+        // Special-case: server refused because the app already exists in the
+        // target env. Show a dedicated panel with a link to Delete App
+        // instead of a plain error status line. Plan area stays empty —
+        // no misleading preview of an import that can't run.
+        if (err && err.status === 409 && err.body && err.body.code === 'APP_ALREADY_EXISTS') {
+            state.lastPlan = null;
+            planResultsEl.innerHTML = '';
+            const el = document.getElementById('fetch-status');
+            if (el) el.classList.add('hidden');
+            renderAppAlreadyExists(err.body, appId, targetEnv, planResultsEl);
+        } else {
+            showStatus(`Plan failed: ${err.message}`, 'error');
+        }
     } finally {
         planBtn.disabled = false;
         planBtn.innerHTML = originalHtml;
@@ -266,43 +279,252 @@ function closeExecuteModal() {
 }
 
 async function runExecute(appId, sourceEnv, targetEnv, confirmToken, lookupColumn) {
-    const doBtn = document.getElementById('btn-do-execute');
-    const cancelBtn = document.getElementById('btn-cancel-execute');
-    doBtn.disabled = true;
-    cancelBtn.disabled = true;
-    doBtn.textContent = 'Executing…';
+    // Close the confirmation modal and switch to the live-progress panel.
+    // The panel renders every table from the plan preview and updates
+    // its per-table status by polling the journal on disk.
+    closeExecuteModal();
+    openProgressPanel();
 
+    const started = Date.now();
+    const poller = startJournalPoller();
     try {
         const journal = await executeImport({
             appId, lookupColumn, sourceEnv, targetEnv,
             confirm: true, confirmToken,
         });
-        closeExecuteModal();
-        renderExecuteResult(journal);
+        const elapsed = Date.now() - started;
+        // One last render with the authoritative journal from the response
+        renderProgressPanel(journal, elapsed, /*done=*/ true);
+        renderExecuteResult(journal, elapsed);
         const st = journal.status;
         const entryCount = (journal.entries || []).length;
+        const took = formatDuration(elapsed);
         let toastMsg, toastKind;
         if (st === 'success') {
-            toastMsg = `Import complete — ${entryCount} rows written.`;
+            toastMsg = `Import complete — ${entryCount} rows written in ${took}.`;
             toastKind = 'success';
         } else if (st === 'failed-rolled-back') {
-            toastMsg = `Import halted — target rolled back cleanly. See details below.`;
+            toastMsg = `Import halted after ${took} — target rolled back cleanly. See details below.`;
             toastKind = 'info';
         } else {
-            toastMsg = `Import halted after ${entryCount} step(s); rollback incomplete. See details.`;
+            toastMsg = `Import halted after ${entryCount} step(s) in ${took}; rollback incomplete. See details.`;
             toastKind = 'error';
         }
         (window.showToast || alert)(toastMsg, toastKind, 7000);
     } catch (err) {
-        (window.showToast || alert)('Execute failed: ' + err.message, 'error');
+        const elapsed = Date.now() - started;
+        // Special-case the "app already exists in target" refusal — that's
+        // an expected, actionable state (not a bug). Render a dedicated
+        // panel with a link to Delete App so the user isn't left staring
+        // at a generic red toast.
+        if (err && err.status === 409 && err.body && err.body.code === 'APP_ALREADY_EXISTS') {
+            renderAppAlreadyExists(err.body, appId, targetEnv, document.getElementById('execute-results'));
+            (window.showToast || alert)(
+                `Import refused — app already exists in ${targetEnv}. See details below.`,
+                'error', 7000);
+        } else {
+            (window.showToast || alert)(
+                `Execute failed after ${formatDuration(elapsed)}: ${err.message}`, 'error');
+        }
     } finally {
-        doBtn.disabled = false;
-        cancelBtn.disabled = false;
-        doBtn.textContent = 'Execute now';
+        if (poller) clearInterval(poller);
+        if (progressState.elapsedTimer) { clearInterval(progressState.elapsedTimer); progressState.elapsedTimer = null; }
     }
 }
 
-function renderExecuteResult(journal) {
+function renderAppAlreadyExists(body, appId, targetEnv, targetEl) {
+    // Render into the caller-specified element so this works from both the
+    // plan-preview path (writes into #plan-results) and the execute path
+    // (writes into #execute-results). Falls back to #execute-results for
+    // backward compat if called with fewer args.
+    const el = targetEl || document.getElementById('execute-results');
+    if (!el) return;
+    const rowCount = body.existingRowCount != null ? body.existingRowCount : '?';
+    const envLabel = targetEnv || '(target)';
+    el.innerHTML = `
+        <div class="execute-summary card app-exists-panel">
+            <h3 style="margin-top:0">App already exists in ${escapeHtml(envLabel)}</h3>
+            <p>
+                An instance of app <code>${escapeHtml(String(appId))}</code> is already
+                present in <strong>${escapeHtml(envLabel)}</strong>
+                (<strong>${rowCount}</strong> matching row${rowCount === 1 ? '' : 's'} on the root table).
+                Import is refused so the target isn't left in an ambiguous state.
+                Delete the existing instance first, then re-run the import.
+            </p>
+            <div class="app-exists-actions">
+                <a href="#/delete-app" class="btn danger">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+                    Go to Delete App
+                </a>
+                <span class="muted">Delete the existing instance, then come back here.</span>
+            </div>
+        </div>
+    `;
+}
+
+/* ---------- Live progress panel (polls the journal on disk) ---------- */
+
+const progressState = {
+    startedAt: 0,
+    pollTimer: null,
+    elapsedTimer: null,
+};
+
+function openProgressPanel() {
+    const container = document.getElementById('execute-results');
+    if (!container) return;
+    progressState.startedAt = Date.now();
+    const plan = state.lastPlan;
+    const steps = (plan && plan.steps) || [];
+    container.innerHTML = `
+        <div class="import-progress card" id="import-progress-panel">
+            <div class="import-progress-header">
+                <div>
+                    <h3 style="margin:0">Import in progress</h3>
+                    <p class="muted" style="margin:4px 0 0 0">
+                        Watching the journal for per-table updates every second.
+                    </p>
+                </div>
+                <div class="import-progress-stats">
+                    <div><span class="import-progress-num" id="progress-rows-done">0</span> / <span id="progress-rows-total">${plan ? plan.totalRows : 0}</span> rows</div>
+                    <div class="muted"><span id="progress-elapsed">0s</span> elapsed</div>
+                </div>
+            </div>
+            <ol class="import-progress-list" id="import-progress-list">
+                ${steps.map(s => `
+                    <li class="import-progress-step" data-table="${escapeHtml(s.tableName)}">
+                        <span class="import-progress-icon" data-status="pending">⏳</span>
+                        <span class="import-progress-name">${escapeHtml(s.tableName)}</span>
+                        <span class="import-progress-meta">${s.rowCount} row${s.rowCount === 1 ? '' : 's'} expected</span>
+                    </li>
+                `).join('')}
+            </ol>
+        </div>
+    `;
+    // Elapsed-time ticker (visual polish; independent from journal poll)
+    progressState.elapsedTimer = setInterval(() => {
+        const el = document.getElementById('progress-elapsed');
+        if (el) el.textContent = formatDuration(Date.now() - progressState.startedAt);
+    }, 500);
+}
+
+function startJournalPoller() {
+    if (!state.profile || !state.profile.id) return null;
+    const profileId = state.profile.id;
+    const initialTs = progressState.startedAt;
+    // Poll every 1 second. Each response updates the panel with the current
+    // authoritative journal state written by the executor.
+    progressState.pollTimer = setInterval(async () => {
+        try {
+            const journal = await getLatestImportJournal(profileId);
+            if (!journal) return;
+            // Reject stale journals from previous imports (started before this run)
+            const journalStarted = journal.startedAt ? new Date(journal.startedAt).getTime() : 0;
+            if (journalStarted > 0 && journalStarted + 3000 < initialTs) return;
+            renderProgressPanel(journal, Date.now() - progressState.startedAt, /*done=*/ false);
+        } catch { /* silent — next tick will retry */ }
+    }, 1000);
+    return progressState.pollTimer;
+}
+
+// Update the progress list with per-table status based on journal entries.
+// The journal has entries in insertion order; group by table and take the
+// last status per table. Match to the plan-preview steps by tableName.
+function renderProgressPanel(journal, elapsedMs, done) {
+    const list = document.getElementById('import-progress-list');
+    if (!list || !journal) return;
+
+    const entries = journal.entries || [];
+    // Group by table — track latest result per table + count of rows created
+    const byTable = new Map();
+    for (const e of entries) {
+        if (!e || !e.tableName) continue;
+        const prev = byTable.get(e.tableName) || { created: 0, failed: 0, skipped: 0, lastResult: null, lastMsg: '', usedSql: false };
+        if (e.result === 'created' || e.result === 'created-then-error') prev.created++;
+        else if (e.result === 'failed') prev.failed++;
+        else if (e.result === 'skipped') prev.skipped++;
+        if ((e.action || '').toLowerCase().includes('sql')) prev.usedSql = true;
+        prev.lastResult = e.result;
+        prev.lastMsg = e.message || '';
+        byTable.set(e.tableName, prev);
+    }
+
+    // The most recent tableName seen (highest order) is presumably the "in
+    // progress" one — journal is written after each row, so the last table
+    // to have written is either done or actively processing more rows.
+    const lastEntry = entries.length > 0 ? entries[entries.length - 1] : null;
+    const activeTable = done ? null : (lastEntry ? lastEntry.tableName : null);
+
+    // Journal-level status. The executor sets:
+    //   'success'            → all rows inserted, nothing to worry about
+    //   'failed-rolled-back' → halt occurred, rollback wiped every inserted row
+    //   'failed'             → halt occurred, rollback either couldn't run or was partial
+    // Per-entry results still say 'created' even after rollback, so we have
+    // to reinterpret them based on the top-level status.
+    const jStatus = journal.status || '';
+    const wasRolledBack = jStatus === 'failed-rolled-back';
+    const failedButRowsMayRemain = jStatus === 'failed';
+
+    let rowsDone = 0;
+    list.querySelectorAll('.import-progress-step').forEach(li => {
+        const tableName = li.dataset.table;
+        const stat = byTable.get(tableName);
+        const iconEl = li.querySelector('.import-progress-icon');
+        const metaEl = li.querySelector('.import-progress-meta');
+        if (!stat) {
+            // Not yet touched. If import is done, mark it (skipped or unreached).
+            if (done) {
+                iconEl.textContent = '—';
+                iconEl.dataset.status = 'unreached';
+                metaEl.textContent = 'not reached';
+            } else {
+                iconEl.textContent = '⏳';
+                iconEl.dataset.status = 'pending';
+            }
+            return;
+        }
+        rowsDone += stat.created;
+        if (stat.failed > 0) {
+            iconEl.textContent = '✗';
+            iconEl.dataset.status = 'failed';
+            metaEl.textContent = `${stat.created} created, ${stat.failed} failed`;
+            li.setAttribute('title', stat.lastMsg);
+        } else if (activeTable === tableName) {
+            iconEl.textContent = '↻';
+            iconEl.dataset.status = 'in-progress';
+            metaEl.textContent = `${stat.created} inserted…`;
+        } else if (done && wasRolledBack && stat.created > 0) {
+            // Halt + successful rollback: rows that got inserted are now GONE.
+            // Show that clearly instead of a misleading green "N inserted".
+            iconEl.textContent = '⤺';
+            iconEl.dataset.status = 'rolled-back';
+            metaEl.textContent = `${stat.created} rolled back (halt recovered)`;
+        } else if (done && failedButRowsMayRemain && stat.created > 0) {
+            // Halt + rollback didn't fully run: rows might still be in target.
+            // Amber warning so the user knows to check.
+            iconEl.textContent = '!';
+            iconEl.dataset.status = 'done-fallback';
+            metaEl.textContent = `${stat.created} inserted — rollback incomplete; may need manual cleanup`;
+            li.setAttribute('title', 'The overall run halted and rollback did not fully complete. Check the journal.');
+        } else {
+            iconEl.textContent = '✓';
+            iconEl.dataset.status = stat.usedSql ? 'done-fallback' : 'done';
+            const badge = stat.usedSql ? ' (SQL fallback)' : '';
+            metaEl.textContent = `${stat.created} inserted${badge}`;
+        }
+    });
+
+    const rowsDoneEl = document.getElementById('progress-rows-done');
+    if (rowsDoneEl) rowsDoneEl.textContent = rowsDone;
+    const elapsedEl = document.getElementById('progress-elapsed');
+    if (elapsedEl && done) {
+        elapsedEl.textContent = formatDuration(elapsedMs);
+        if (progressState.elapsedTimer) { clearInterval(progressState.elapsedTimer); progressState.elapsedTimer = null; }
+    }
+    if (done && progressState.pollTimer) { clearInterval(progressState.pollTimer); progressState.pollTimer = null; }
+}
+
+function renderExecuteResult(journal, elapsedMs) {
     const el = document.getElementById('execute-results');
     if (!el || !journal) return;
     const statusClass = journal.status === 'success' ? 'success'
@@ -311,6 +533,9 @@ function renderExecuteResult(journal) {
         : 'info';
     const successRows = (journal.entries || []).filter(e => e.result === 'created').length;
     const failRows = (journal.entries || []).filter(e => e.result === 'failed').length;
+    const durationPart = typeof elapsedMs === 'number'
+        ? ` &middot; elapsed <strong>${formatDuration(elapsedMs)}</strong>`
+        : '';
     el.innerHTML = `
         <div class="execute-summary card">
             <h3 style="margin-top:0">Import result — ${escapeHtml(journal.status || 'unknown')}</h3>
@@ -319,7 +544,7 @@ function renderExecuteResult(journal) {
             </div>
             <div class="execute-summary-line">
                 <strong>${successRows}</strong> row${successRows === 1 ? '' : 's'} created
-                &middot; <strong>${failRows}</strong> failed
+                &middot; <strong>${failRows}</strong> failed${durationPart}
                 &middot; job <code>${escapeHtml(journal.jobId || '')}</code>
             </div>
             <details>
@@ -547,4 +772,21 @@ function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => (
         { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
     ));
+}
+
+// Render a millisecond count as the most readable form:
+//   <1s -> "823 ms"
+//   <60s -> "4.2s"
+//   <60m -> "3m 12s"
+//   else -> "1h 4m 12s"
+function formatDuration(ms) {
+    if (ms == null || ms < 0) return '—';
+    if (ms < 1000) return `${ms} ms`;
+    const totalSec = Math.round(ms / 1000);
+    if (totalSec < 60) return `${(ms / 1000).toFixed(1)}s`;
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    return `${m}m ${s}s`;
 }

@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -59,6 +60,24 @@ public class AppSqlFetchService {
     public FetchResult fetch(ProjectProfile profile, String sourceEnv, DataModel dataModel,
                              String rootTable, String rootFilterColumn, Object sourceAppId,
                              List<String> referenceTables) throws Exception {
+        return fetch(profile, sourceEnv, dataModel, rootTable, rootFilterColumn,
+                sourceAppId, referenceTables, /*scanOrphans=*/ false);
+    }
+
+    /**
+     * Same as the 7-arg overload but with an option to also gather "orphan"
+     * rows: tables that are NOT FK-reachable from the root but have a column
+     * whose name matches the filter column and whose value matches the filter
+     * value. Used by the delete flow to catch denormalized / log / audit
+     * tables that stamp the app id but aren't wired into the FK graph.
+     *
+     * <p>The import flow should NOT set this to true — orphan rows aren't
+     * FK-tied to the app graph, so we can't remap their contents when copying
+     * to a target env.
+     */
+    public FetchResult fetch(ProjectProfile profile, String sourceEnv, DataModel dataModel,
+                             String rootTable, String rootFilterColumn, Object sourceAppId,
+                             List<String> referenceTables, boolean scanOrphans) throws Exception {
         Objects.requireNonNull(profile, "profile");
         Objects.requireNonNull(dataModel, "dataModel");
         if (rootTable == null || rootTable.isBlank()) {
@@ -82,70 +101,220 @@ public class AppSqlFetchService {
         Map<String, List<Map<String, Object>>> gathered = new LinkedHashMap<>();
         List<String> visitOrder = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
+        Set<String> orphanTables = new LinkedHashSet<>();
 
         // 1. Fetch the root row
         String rootSql = SqlBuilder.selectByEquals(root.name(), filterCol, sourceAppId);
         List<Map<String, Object>> rootRows = runSelect(profile, sourceEnv, rootSql);
         if (rootRows.isEmpty()) {
             warnings.add("No row found in " + root.name() + " where " + filterCol + " = " + sourceAppId);
-            return new FetchResult(gathered, visitOrder, warnings, graph);
+            return new FetchResult(gathered, visitOrder, warnings, graph, orphanTables);
         }
         gathered.put(FkGraph.norm(root.name()), rootRows);
         visitOrder.add(FkGraph.norm(root.name()));
 
-        // 2. BFS downward through the FK graph
+        // 2. BFS downward through the FK graph — level-based with parallel
+        // per-level child queries. Each iteration drains the entire current
+        // frontier (all parents at the same topological depth), collects
+        // every child SELECT that needs to run, fires them concurrently
+        // via a small pool, then processes results in submission order to
+        // keep visitOrder + gathered mutation deterministic on the main
+        // thread. Workers only run SELECTs — no shared state mutation.
         Deque<String> frontier = new ArrayDeque<>();
         frontier.add(FkGraph.norm(root.name()));
         Set<String> processed = new HashSet<>();
         processed.add(FkGraph.norm(root.name()));
 
         while (!frontier.isEmpty()) {
-            String parent = frontier.poll();
-            DataModel.Table parentTable = graph.table(parent).orElse(null);
-            if (parentTable == null) continue;
+            // Drain the current level (all parents at this depth).
+            List<String> currentLevel = new ArrayList<>(frontier);
+            frontier.clear();
 
-            for (FkGraph.Edge edge : graph.children(parent)) {
-                String childName = FkGraph.norm(edge.childTable());
-                if (childName.equals(parent)) continue;    // self-reference — separate handling
-                if (refSet.contains(childName)) continue;   // reference — never walked
-                DataModel.Table childTable = graph.table(childName).orElse(null);
-                if (childTable == null) continue;
+            // Collect every child SELECT we need to run for this level.
+            List<ChildQuery> queries = new ArrayList<>();
+            for (String parent : currentLevel) {
+                DataModel.Table parentTable = graph.table(parent).orElse(null);
+                if (parentTable == null) continue;
+                for (FkGraph.Edge edge : graph.children(parent)) {
+                    String childName = FkGraph.norm(edge.childTable());
+                    if (childName.equals(parent)) continue;
+                    if (refSet.contains(childName)) continue;
+                    DataModel.Table childTable = graph.table(childName).orElse(null);
+                    if (childTable == null) continue;
+                    List<Map<String, Object>> parentRows = gathered.get(parent);
+                    if (parentRows == null || parentRows.isEmpty()) continue;
+                    List<Object> parentPks = extractColumn(parentRows, edge.parentPkColumn());
+                    if (parentPks.isEmpty()) continue;
+                    String sql = SqlBuilder.selectByIn(childTable.name(), edge.fkColumn(), parentPks);
+                    if (sql == null) continue;
+                    queries.add(new ChildQuery(parent, childTable, childName, edge, sql));
+                }
+            }
+            if (queries.isEmpty()) continue;
 
-                // Collect the parent-side PK values from what we've already fetched
-                List<Map<String, Object>> parentRows = gathered.get(parent);
-                if (parentRows == null || parentRows.isEmpty()) continue;
-                List<Object> parentPks = extractColumn(parentRows, edge.parentPkColumn());
-                if (parentPks.isEmpty()) continue;
-
-                String sql = SqlBuilder.selectByIn(childTable.name(), edge.fkColumn(), parentPks);
-                if (sql == null) continue;
-
-                List<Map<String, Object>> childRows;
+            // Fire the SELECTs — concurrent if there are >1, inline otherwise
+            List<ChildResult> results;
+            if (queries.size() > 1) {
+                int nThreads = Math.min(6, queries.size());
+                final java.util.concurrent.atomic.AtomicInteger tid = new java.util.concurrent.atomic.AtomicInteger();
+                java.util.concurrent.ExecutorService pool =
+                        java.util.concurrent.Executors.newFixedThreadPool(nThreads, r -> {
+                            Thread th = new Thread(r, "devbridge-fk-walk-" + tid.incrementAndGet());
+                            th.setDaemon(true);
+                            return th;
+                        });
+                List<java.util.concurrent.Future<ChildResult>> futures = new ArrayList<>(queries.size());
+                for (final ChildQuery q : queries) {
+                    futures.add(pool.submit(() -> {
+                        try {
+                            return new ChildResult(q, runSelect(profile, sourceEnv, q.sql()), null);
+                        } catch (Exception ex) {
+                            return new ChildResult(q, null, ex);
+                        }
+                    }));
+                }
+                pool.shutdown();
+                log.info("FK walk parallel: level with {} parent(s), {} child SELECT(s) across {} thread(s)",
+                        currentLevel.size(), queries.size(), nThreads);
+                results = new ArrayList<>(queries.size());
                 try {
-                    childRows = runSelect(profile, sourceEnv, sql);
-                } catch (Exception e) {
-                    warnings.add("SELECT failed for " + childTable.name() + " via "
-                            + edge.fkColumn() + " -> " + parent + "." + edge.parentPkColumn()
-                            + ": " + e.getMessage());
+                    for (java.util.concurrent.Future<ChildResult> f : futures) results.add(f.get());
+                } finally {
+                    pool.shutdownNow();
+                }
+            } else {
+                ChildQuery q = queries.get(0);
+                try {
+                    results = java.util.List.of(new ChildResult(q, runSelect(profile, sourceEnv, q.sql()), null));
+                } catch (Exception ex) {
+                    results = java.util.List.of(new ChildResult(q, null, ex));
+                }
+            }
+
+            // Process results sequentially so gathered/visitOrder/frontier mutations
+            // stay deterministic. Order matches submission order = graph.children()
+            // iteration order = the same order the old serial code visited them.
+            for (ChildResult r : results) {
+                if (r.exception() != null) {
+                    warnings.add("SELECT failed for " + r.query().childTable().name() + " via "
+                            + r.query().edge().fkColumn() + " -> " + r.query().parent()
+                            + "." + r.query().edge().parentPkColumn() + ": " + r.exception().getMessage());
                     continue;
                 }
-                if (childRows.isEmpty()) continue;
-
-                // Merge (a child may be reached from multiple parents — dedupe by PK value)
+                if (r.rows() == null || r.rows().isEmpty()) continue;
+                String childName = r.query().childName();
                 List<Map<String, Object>> existing = gathered.get(childName);
                 if (existing == null) {
-                    gathered.put(childName, childRows);
+                    gathered.put(childName, r.rows());
                     visitOrder.add(childName);
                 } else {
-                    String childPk = firstPkColumn(childTable);
-                    if (childPk != null) mergeRows(existing, childRows, childPk);
-                    else existing.addAll(childRows);
+                    String childPk = firstPkColumn(r.query().childTable());
+                    if (childPk != null) mergeRows(existing, r.rows(), childPk);
+                    else existing.addAll(r.rows());
                 }
                 if (processed.add(childName)) frontier.add(childName);
             }
         }
-        return new FetchResult(gathered, visitOrder, warnings, graph);
+
+        // 3. Optional orphan scan — pick up rows in tables that have a column
+        // named like the filter column but are NOT reachable through the FK
+        // graph. Common in real schemas: audit logs, denormalized reporting
+        // tables, integration queues that stamp the app id as a plain column.
+        // Only enabled for the delete flow; import intentionally skips these.
+        //
+        // Perf: the candidate scan runs one SELECT per table with a matching
+        // column — up to ~90 on wfs. Each is independent (no shared state
+        // read/write during workers), so we fire them concurrently and then
+        // collect results in submission order to keep visitOrder stable.
+        if (scanOrphans) {
+            String filterColLower = filterCol.toLowerCase(Locale.ROOT);
+            // First pass: locally identify orphan candidates (no HTTP).
+            List<DataModel.Table> candidates = new ArrayList<>();
+            List<String> matchedCols = new ArrayList<>();
+            for (DataModel.Table t : dataModel.tables()) {
+                if (t == null || t.name() == null || t.columns() == null) continue;
+                String upper = FkGraph.norm(t.name());
+                if (upper.equals(FkGraph.norm(root.name()))) continue;
+                if (gathered.containsKey(upper)) continue;
+                if (refSet.contains(upper)) continue;
+                String matched = null;
+                for (DataModel.Column c : t.columns()) {
+                    if (c != null && c.name() != null
+                            && c.name().toLowerCase(Locale.ROOT).equals(filterColLower)) {
+                        matched = c.name();
+                        break;
+                    }
+                }
+                if (matched == null) continue;
+                candidates.add(t);
+                matchedCols.add(matched);
+            }
+
+            // Second pass: fire the SELECTs concurrently. Daemon threads so
+            // a leak can't hang the JVM. All state mutation (gathered, warnings,
+            // orphanTables) still happens sequentially in the collector loop
+            // below — workers only run the SELECT and return results.
+            if (!candidates.isEmpty()) {
+                int nThreads = Math.min(6, candidates.size());
+                final java.util.concurrent.atomic.AtomicInteger tid = new java.util.concurrent.atomic.AtomicInteger();
+                java.util.concurrent.ExecutorService orphanPool =
+                        java.util.concurrent.Executors.newFixedThreadPool(nThreads, r -> {
+                            Thread th = new Thread(r, "devbridge-orphan-scan-" + tid.incrementAndGet());
+                            th.setDaemon(true);
+                            return th;
+                        });
+                List<java.util.concurrent.Future<OrphanScanResult>> futures = new ArrayList<>(candidates.size());
+                for (int i = 0; i < candidates.size(); i++) {
+                    final DataModel.Table t = candidates.get(i);
+                    final String matched = matchedCols.get(i);
+                    futures.add(orphanPool.submit(() -> {
+                        String sql = SqlBuilder.selectByEquals(t.name(), matched, sourceAppId);
+                        try {
+                            return new OrphanScanResult(t, matched, runSelect(profile, sourceEnv, sql), null);
+                        } catch (Exception ex) {
+                            return new OrphanScanResult(t, matched, null, ex);
+                        }
+                    }));
+                }
+                orphanPool.shutdown();
+                log.info("Orphan scan parallel prefetch: {} candidates across {} thread(s)",
+                        candidates.size(), nThreads);
+                try {
+                    for (java.util.concurrent.Future<OrphanScanResult> f : futures) {
+                        OrphanScanResult r = f.get();
+                        if (r.exception != null) {
+                            warnings.add("Orphan scan: SELECT failed for " + r.table.name() + " on "
+                                    + r.matchedCol + ": " + r.exception.getMessage());
+                            continue;
+                        }
+                        if (r.rows == null || r.rows.isEmpty()) continue;
+                        String upper = FkGraph.norm(r.table.name());
+                        gathered.put(upper, r.rows);
+                        visitOrder.add(upper);
+                        orphanTables.add(upper);
+                        warnings.add("Orphan match: " + r.table.name() + " has " + r.rows.size()
+                                + " row(s) with " + r.matchedCol + " = " + sourceAppId
+                                + " (not FK-linked to root — added to delete plan)");
+                    }
+                } finally {
+                    orphanPool.shutdownNow();
+                }
+            }
+        }
+
+        return new FetchResult(gathered, visitOrder, warnings, graph, orphanTables);
     }
+
+    /** Outcome of one orphan-scan SELECT run on a worker thread. */
+    private record OrphanScanResult(DataModel.Table table, String matchedCol,
+                                    List<Map<String, Object>> rows, Exception exception) {}
+
+    /** One child-table SELECT to fire during the level-based FK walk. */
+    private record ChildQuery(String parent, DataModel.Table childTable, String childName,
+                              FkGraph.Edge edge, String sql) {}
+
+    /** Result of running a {@link ChildQuery} on a worker thread. */
+    private record ChildResult(ChildQuery query, List<Map<String, Object>> rows, Exception exception) {}
 
     /**
      * Run a single SELECT against the given env and parse the response envelopes
@@ -256,8 +425,14 @@ public class AppSqlFetchService {
             Map<String, List<Map<String, Object>>> rowsByTable,
             List<String> visitOrder,
             List<String> warnings,
-            FkGraph graph
+            FkGraph graph,
+            Set<String> orphanTables
     ) {
+        // Backward-compat: 4-arg constructor for callers that don't need orphan tracking.
+        public FetchResult(Map<String, List<Map<String, Object>>> rowsByTable,
+                           List<String> visitOrder, List<String> warnings, FkGraph graph) {
+            this(rowsByTable, visitOrder, warnings, graph, java.util.Collections.emptySet());
+        }
         public int totalRowCount() {
             int n = 0;
             for (List<Map<String, Object>> l : rowsByTable.values()) n += l.size();

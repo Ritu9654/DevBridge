@@ -10,6 +10,8 @@ import {
     getDataModelSummary,
     uploadDataModel,
     deleteDataModel,
+    exportProfilesToJson,
+    importProfilesFromJson,
 } from '../api.js';
 
 const FIELDS = [
@@ -32,14 +34,6 @@ const FIELDS = [
       help: 'OAuth2 client secret. Stored in the profile JSON on disk (%USERPROFILE%\\.devbridge\\profiles\\) — never committed to git.' },
     { key: 'rootTableName', label: 'Root table name', placeholder: 'e.g. CASE_HEADER, APPLICATION',
       help: 'DB table the import walker starts from. All downstream tables and their insert order are derived from the FK graph automatically. Required for Import App.' },
-    { key: 'rootPkFilterColumn', label: 'Root PK filter column (optional)', placeholder: 'Blank = root table\'s PK',
-      help: 'Column on the root table used to filter one app (e.g. "ID" for CASE_HEADER). Leave blank to use the root table\'s primary key.' },
-    { key: 'facadeServicePath', label: 'Facade service path (optional)', placeholder: 'yourFacadeService',
-      help: 'Only used by the facade cross-check — an advisory comparison of the FK-walk result against FAWB\'s composite facade output. The import itself is FK-graph driven and doesn\'t need these fields.' },
-    { key: 'facadeEndpoint', label: 'Facade endpoint (optional)', placeholder: '/entity',
-      help: 'Path within the facade service. Only used by the cross-check.' },
-    { key: 'facadeQueryParam', label: 'Facade query param (optional)', placeholder: 'entityId',
-      help: 'Just the parameter name — no "=", no value. Only used by the cross-check. Preserve any typos exactly (e.g. "applicantionId").' },
 ];
 
 const AVATAR_PALETTE = [
@@ -55,16 +49,40 @@ export const profilesView = {
     title: 'Project Profiles',
     render() {
         return `
-            <h2>Project Profiles</h2>
-            <p>One profile per project. Only <strong>Profile name</strong> is required to save. Click any inactive card to activate — the active profile drives every module.</p>
-
-            <div class="section-header">
-                <h3>Existing profiles</h3>
-                <button class="btn" id="btn-show-add">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                    Add profile
-                </button>
+            <div class="profiles-header">
+                <div class="profiles-header-text">
+                    <h2>Project Profiles</h2>
+                    <p>One profile per project. Only <strong>Profile name</strong> is required to save. Click any inactive card to activate — the active profile drives every module.</p>
+                </div>
+                <div class="section-header-actions profiles-header-actions">
+                    <button class="btn secondary" id="btn-import-profiles" title="Import profiles from a JSON file">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        Import
+                    </button>
+                    <button class="btn secondary" id="btn-export-profiles" title="Download all profiles as a JSON file (includes OAuth secrets — treat as sensitive)">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        Export all
+                    </button>
+                    <button class="btn" id="btn-show-add">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        Add profile
+                    </button>
+                </div>
             </div>
+            <p class="form-help">
+                Profiles live in <strong>this browser only</strong> — nothing is stored on the server.
+                Use <strong>Export</strong> to back them up or hand them to a teammate.
+                The export file includes OAuth client secrets when set on the profile;
+                treat it like a password.
+            </p>
+
+            <section id="profiles-status-section" aria-live="polite">
+                <div class="home-status-panel" id="profiles-status-panel">
+                    ${renderStatusSkeleton()}
+                </div>
+            </section>
+
+            <h3 class="profiles-list-heading">Existing profiles</h3>
             <div id="profiles-list"></div>
 
             <div class="add-form-wrapper hidden" id="add-form-wrapper">
@@ -95,23 +113,6 @@ export const profilesView = {
                     <div class="form-section">
                         <hr class="form-divider">
                         <div class="form-section-title">
-                            <h4>Facade key overrides <span class="hint-inline">(advanced — cross-check only)</span></h4>
-                        </div>
-                        <p class="form-help">
-                            Map facade JSON keys to DB table names, used only by the facade cross-check
-                            (an advisory comparison between the facade's coverage and the FK-walk result).
-                            The import itself is FK-graph driven and doesn't depend on these.
-                            Format: JSON object mapping key → table name.
-                        </p>
-                        <textarea id="field-facadeKeyOverrides" name="facadeKeyOverrides" class="json-overrides-input"
-                                  rows="4" spellcheck="false"
-                                  placeholder='{"applicants": "CASE_PARTY", "productDecisionOutputs": "PRODUCT_DECISION_OUTPUT_EXTRACT"}'></textarea>
-                        <p class="form-help" id="facade-overrides-error"></p>
-                    </div>
-
-                    <div class="form-section">
-                        <hr class="form-divider">
-                        <div class="form-section-title">
                             <h4>Reference / setup tables <span class="hint-inline">(never written)</span></h4>
                         </div>
                         <p class="form-help">
@@ -125,30 +126,6 @@ export const profilesView = {
                                   placeholder="DomainValue, Locale, Permission"></textarea>
                     </div>
 
-                    <div class="form-section">
-                        <hr class="form-divider">
-                        <div class="form-section-title">
-                            <h4>Reference-table overrides <span class="hint-inline">(usually leave blank)</span></h4>
-                        </div>
-                        <p class="form-help">
-                            <strong>Auto-detected by default</strong> — you don't need to fill this out unless
-                            something's wrong. Before each import, the tool inspects the target DB's unique
-                            indexes to figure out the natural key of every reference table the app touches
-                            (DOMAINVALUE, PRODUCT, etc.) and remaps FKs by matching on that key. The plan
-                            preview shows what was detected.
-                        </p>
-                        <p class="form-help">
-                            Only add an entry here to <strong>override</strong> a specific table when auto-detection
-                            picks the wrong natural key. User overrides win per-table; unlisted tables continue
-                            to use auto-detection. Keys are physical DB table names. Format:
-                            <code>{"TABLE": {"naturalKey": ["col1","col2"], "activeFilter": "IsActive=1"}}</code>
-                        </p>
-                        <textarea id="field-referenceTableConfigs" name="referenceTableConfigs" class="json-overrides-input"
-                                  rows="6" spellcheck="false"
-                                  placeholder='{"DOMAINVALUE": {"naturalKey": ["Code","DomainValueType"], "activeFilter": "IsActive=1"}, "DOMAINVALUETYPE": {"naturalKey": ["Code"]}}'></textarea>
-                        <p class="form-help" id="reference-configs-error"></p>
-                    </div>
-
                     <div class="form-actions">
                         <button type="submit" class="btn" id="btn-submit">Save profile</button>
                         <button type="button" class="btn secondary" id="btn-cancel-add">Cancel</button>
@@ -159,6 +136,7 @@ export const profilesView = {
     },
     async mount() {
         await refreshList();
+        refreshStatusAndContext().catch(() => {});
         document.getElementById('btn-show-add').addEventListener('click', () => {
             resetFormMode();
             document.getElementById('add-form-wrapper').classList.remove('hidden');
@@ -170,6 +148,8 @@ export const profilesView = {
             resetFormMode();
         });
         document.getElementById('add-profile-form').addEventListener('submit', onSubmit);
+        document.getElementById('btn-export-profiles').addEventListener('click', handleExportAll);
+        document.getElementById('btn-import-profiles').addEventListener('click', handleImportClick);
 
         // DataModel upload / remove buttons inside the edit form
         document.getElementById('btn-upload-dm').addEventListener('click', async (e) => {
@@ -183,7 +163,7 @@ export const profilesView = {
                 await deleteDataModel(editingProfileId);
                 (window.showToast || alert)('DataModel removed.', 'info');
                 await refreshFormDataModel(editingProfileId);
-                await refreshDataModelStatus(editingProfileId);
+                refreshStatusAndContext().catch(() => {});
             } catch (err) {
                 (window.showToast || alert)('Remove failed: ' + err.message, 'error');
             }
@@ -215,30 +195,6 @@ async function onSubmit(e) {
         if (data[k] === '') delete data[k];
     }
 
-    // facadeKeyOverrides comes in as a raw JSON string from the textarea. Parse + validate.
-    const errEl = document.getElementById('facade-overrides-error');
-    if (errEl) errEl.textContent = '';
-    if (data.facadeKeyOverrides) {
-        try {
-            const parsed = JSON.parse(data.facadeKeyOverrides);
-            if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
-                throw new Error('Must be a JSON object like {"key": "TABLE_NAME"}.');
-            }
-            for (const [k, v] of Object.entries(parsed)) {
-                if (typeof v !== 'string' || v.trim() === '') {
-                    throw new Error(`Value for key "${k}" must be a non-empty string.`);
-                }
-            }
-            data.facadeKeyOverrides = parsed;
-        } catch (err) {
-            if (errEl) errEl.textContent = 'Invalid facade key overrides: ' + err.message;
-            (window.showToast || alert)('Invalid facade key overrides: ' + err.message, 'error');
-            return;
-        }
-    } else {
-        delete data.facadeKeyOverrides;
-    }
-
     // referenceTables comes in as comma-separated text. Parse to array of trimmed non-empty strings.
     if (data.referenceTables) {
         const list = String(data.referenceTables)
@@ -249,41 +205,6 @@ async function onSubmit(e) {
         else data.referenceTables = list;
     } else {
         delete data.referenceTables;
-    }
-
-    // referenceTableConfigs is a raw JSON string from the textarea. Parse + validate.
-    const refCfgErrEl = document.getElementById('reference-configs-error');
-    if (refCfgErrEl) refCfgErrEl.textContent = '';
-    if (data.referenceTableConfigs) {
-        try {
-            const parsed = JSON.parse(data.referenceTableConfigs);
-            if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
-                throw new Error('Must be a JSON object like {"TABLE": {"naturalKey": ["col"]}}.');
-            }
-            for (const [k, v] of Object.entries(parsed)) {
-                if (!v || typeof v !== 'object' || Array.isArray(v)) {
-                    throw new Error(`Entry '${k}' must be an object with naturalKey.`);
-                }
-                if (!Array.isArray(v.naturalKey) || v.naturalKey.length === 0) {
-                    throw new Error(`Entry '${k}': naturalKey must be a non-empty array of column names.`);
-                }
-                for (const col of v.naturalKey) {
-                    if (typeof col !== 'string' || !col.trim()) {
-                        throw new Error(`Entry '${k}': naturalKey contains a non-string or blank column.`);
-                    }
-                }
-                if (v.activeFilter != null && typeof v.activeFilter !== 'string') {
-                    throw new Error(`Entry '${k}': activeFilter must be a string when set.`);
-                }
-            }
-            data.referenceTableConfigs = parsed;
-        } catch (err) {
-            if (refCfgErrEl) refCfgErrEl.textContent = 'Invalid reference table configs: ' + err.message;
-            (window.showToast || alert)('Invalid reference table configs: ' + err.message, 'error');
-            return;
-        }
-    } else {
-        delete data.referenceTableConfigs;
     }
 
     try {
@@ -321,25 +242,11 @@ function startEdit(profile) {
         const input = form.querySelector(`[name="${f.key}"]`);
         if (input) input.value = profile[f.key] != null ? profile[f.key] : '';
     });
-    // facadeKeyOverrides is stored as an object — render as pretty JSON string in the textarea
-    const jsonInput = form.querySelector('[name="facadeKeyOverrides"]');
-    if (jsonInput) {
-        jsonInput.value = profile.facadeKeyOverrides && Object.keys(profile.facadeKeyOverrides).length
-            ? JSON.stringify(profile.facadeKeyOverrides, null, 2)
-            : '';
-    }
     // referenceTables is stored as an array — render as comma-separated
     const refInput = form.querySelector('[name="referenceTables"]');
     if (refInput) {
         refInput.value = Array.isArray(profile.referenceTables) && profile.referenceTables.length
             ? profile.referenceTables.join(', ')
-            : '';
-    }
-    // referenceTableConfigs is stored as an object — render as pretty JSON in the textarea
-    const refCfgInput = form.querySelector('[name="referenceTableConfigs"]');
-    if (refCfgInput) {
-        refCfgInput.value = profile.referenceTableConfigs && Object.keys(profile.referenceTableConfigs).length
-            ? JSON.stringify(profile.referenceTableConfigs, null, 2)
             : '';
     }
     document.getElementById('form-title').textContent = `Edit profile — ${profile.name || '(unnamed)'}`;
@@ -400,9 +307,6 @@ async function refreshList() {
 
     listEl.innerHTML = `<div class="profile-grid">${profiles.map(p => renderCard(p, activeId)).join('')}</div>`;
 
-    // Kick off dataModel status checks — async, doesn't block card rendering
-    profiles.forEach(p => refreshDataModelStatus(p.id));
-
     listEl.querySelectorAll('.profile-card.clickable').forEach(card => {
         card.addEventListener('click', async (e) => {
             if (e.target.closest('button')) return;
@@ -441,7 +345,6 @@ function renderEmptyState() {
 
 function renderCard(p, activeId) {
     const isActive = p.id === activeId;
-    const urlPreview = extractHost(p.designBaseUrl || p.sandboxBaseUrl || '');
     const initials = avatarInitials(p.name || '?');
     const bg = avatarColor(p.name || '?');
 
@@ -453,12 +356,8 @@ function renderCard(p, activeId) {
                 <div class="profile-avatar" style="background:${bg}">${escapeHtml(initials)}</div>
                 <div class="profile-header">
                     <h4>${escapeHtml(p.name || '(unnamed)')}</h4>
-                    <p class="profile-sub">${escapeHtml(urlPreview || 'No URL')}</p>
                 </div>
                 ${isActive ? '<span class="badge">Active</span>' : ''}
-            </div>
-            <div class="profile-datamodel" data-profile-id="${p.id}">
-                <span class="dm-status dm-loading">Checking dataModel…</span>
             </div>
             <div class="profile-card-actions">
                 <button class="btn secondary btn-sm" data-action="test" data-id="${p.id}">
@@ -468,6 +367,10 @@ function renderCard(p, activeId) {
                 <button class="btn ghost btn-sm" data-action="edit" data-id="${p.id}">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                     Edit
+                </button>
+                <button class="btn ghost btn-sm" data-action="export" data-id="${p.id}" title="Download just this profile as JSON (includes OAuth secret if set)">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    Export
                 </button>
                 <button class="btn ghost btn-sm" data-action="delete" data-id="${p.id}">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
@@ -492,28 +395,6 @@ function ensureFileInput() {
     return input;
 }
 
-async function refreshDataModelStatus(profileId) {
-    const el = document.querySelector(`.profile-datamodel[data-profile-id="${profileId}"]`);
-    if (!el) return;
-    try {
-        const s = await getDataModelSummary(profileId);
-        if (s && s.loaded) {
-            el.innerHTML = `<span class="dm-status dm-loaded" title="Click DataModel to replace or remove">
-                <span class="dm-dot"></span>
-                DataModel: <strong>${s.tables}</strong> tables
-                <span class="dm-hint">· ${formatBytes(s.sizeBytes)}</span>
-            </span>`;
-        } else {
-            el.innerHTML = `<span class="dm-status dm-missing">
-                <span class="dm-dot"></span>
-                DataModel not uploaded
-            </span>`;
-        }
-    } catch {
-        el.innerHTML = `<span class="dm-status dm-missing"><span class="dm-dot"></span>DataModel status unavailable</span>`;
-    }
-}
-
 async function handleUploadDataModel(profileId, btn) {
     const input = ensureFileInput();
     input.value = '';   // reset so re-selecting the same file still triggers change
@@ -527,14 +408,99 @@ async function handleUploadDataModel(profileId, btn) {
         try {
             const res = await uploadDataModel(profileId, file);
             (window.showToast || alert)(res.message || 'DataModel uploaded.', 'success');
-            // Refresh both places that show status: form (if visible) and card
+            // Refresh both places that show status: form (if visible) and top status tiles
             await refreshFormDataModel(profileId);
-            await refreshDataModelStatus(profileId);
+            refreshStatusAndContext().catch(() => {});
         } catch (err) {
             (window.showToast || alert)('Upload failed: ' + err.message, 'error');
         } finally {
             btn.disabled = false;
             btn.innerHTML = originalHtml;
+        }
+    };
+    input.click();
+}
+
+function downloadSingleProfile(profile) {
+    const wrapped = {
+        exportedAt: new Date().toISOString(),
+        source: 'devbridge',
+        profiles: [profile],
+    };
+    const json = JSON.stringify(wrapped, null, 2);
+    const safeName = String(profile.name || 'profile').replace(/[^a-zA-Z0-9-_]+/g, '-').replace(/^-+|-+$/g, '') || 'profile';
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `devbridge-${safeName}-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    const hasSecret = !!(profile.tokenClientSecret && profile.tokenClientSecret.length);
+    const note = hasSecret
+        ? ' File contains the OAuth client secret — share only via trusted channels.'
+        : ' No OAuth secret set on this profile.';
+    (window.showToast || alert)(`Exported "${profile.name || '(unnamed)'}".${note}`, 'success', 6000);
+}
+
+async function handleExportAll() {
+    try {
+        const profiles = await listProfiles();
+        if (!profiles.length) {
+            (window.showToast || alert)('No profiles to export.', 'info');
+            return;
+        }
+        const json = await exportProfilesToJson();
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `devbridge-profiles-${stamp}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        (window.showToast || alert)(
+            `Exported ${profiles.length} profile${profiles.length === 1 ? '' : 's'}. ` +
+            `File contains any OAuth secrets — treat as sensitive.`,
+            'success', 7000);
+    } catch (err) {
+        (window.showToast || alert)('Export failed: ' + err.message, 'error');
+    }
+}
+
+function handleImportClick() {
+    let input = document.getElementById('hidden-profile-import-input');
+    if (!input) {
+        input = document.createElement('input');
+        input.type = 'file';
+        input.id = 'hidden-profile-import-input';
+        input.accept = '.json,application/json';
+        input.style.display = 'none';
+        document.body.appendChild(input);
+    }
+    input.value = '';
+    input.onchange = async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const result = await importProfilesFromJson(text);
+            await refreshList();
+            window.dispatchEvent(new CustomEvent('profile-changed'));
+            const parts = [];
+            if (result.added) parts.push(`${result.added} added`);
+            if (result.replaced) parts.push(`${result.replaced} replaced`);
+            const summary = parts.length ? parts.join(', ') : 'no changes';
+            (window.showToast || alert)(
+                `Import complete — ${summary}. Total in browser: ${result.total}.`,
+                'success', 6000);
+        } catch (err) {
+            (window.showToast || alert)('Import failed: ' + err.message, 'error', 8000);
         }
     };
     input.click();
@@ -564,14 +530,20 @@ async function handleCardAction(btn, e) {
             await refreshList();
             (window.showToast || alert)('Profile deleted.', 'info');
         } else if (action === 'test') {
-            await runTestConnection(id, btn);
+            const profile = profilesCache.find(p => p.id === id);
+            if (!profile) throw new Error('Profile not found in browser storage');
+            await runTestConnection(profile, btn);
+        } else if (action === 'export') {
+            const profile = profilesCache.find(p => p.id === id);
+            if (!profile) throw new Error('Profile not found in browser storage');
+            downloadSingleProfile(profile);
         }
     } catch (err) {
         (window.showToast || alert)(`${action} failed: ${err.message}`, 'error');
     }
 }
 
-async function runTestConnection(profileId, btn) {
+async function runTestConnection(profile, btn) {
     const card = btn.closest('.profile-card');
     const originalHtml = btn.innerHTML;
 
@@ -588,7 +560,7 @@ async function runTestConnection(profileId, btn) {
     btn.textContent = 'Testing…';
     btn.disabled = true;
     try {
-        const results = await testConnection(profileId);
+        const results = await testConnection(profile);
         showTestResults(card, results);
         if (Array.isArray(results) && results.some(r => r.statusCode === 401)) {
             window.dispatchEvent(new CustomEvent('token-expired'));
@@ -655,5 +627,192 @@ function escapeHtml(s) {
 window.addEventListener('profile-changed', () => {
     if (window.location.hash === '#/profiles' && document.getElementById('profiles-list')) {
         refreshList().catch(err => console.error('Profiles refresh failed', err));
+        refreshStatusAndContext().catch(() => {});
     }
 });
+window.addEventListener('token-changed', () => {
+    if (window.location.hash === '#/profiles' && document.getElementById('profiles-status-panel')) {
+        refreshStatusAndContext().catch(() => {});
+    }
+});
+
+/* ---------- Status panel + context card (state-aware header) ---------- */
+
+function renderStatusSkeleton() {
+    return ['Profile', 'DataModel', 'FAWB token'].map(t => `
+        <div class="home-status-tile home-status-tile-loading">
+            <div class="home-status-tile-label">${t}</div>
+            <div class="home-status-tile-value">…</div>
+        </div>
+    `).join('');
+}
+
+async function refreshStatusAndContext() {
+    let profile = null, authOk = false, dm = null;
+    try { profile = await getActiveProfile(); } catch { /* stays null */ }
+    const [authRes, dmRes] = await Promise.all([
+        (async () => { try { return await getAuthStatus(); } catch { return null; } })(),
+        (async () => {
+            if (!profile || !profile.id) return null;
+            try { return await getDataModelSummary(profile.id); } catch { return null; }
+        })(),
+    ]);
+    authOk = !!(authRes && authRes.set);
+    dm = dmRes && dmRes.loaded ? dmRes : null;
+    renderStatusPanel(profile, dm, authOk);
+    renderContextCard(profile, dm, authOk);
+}
+
+function renderStatusPanel(profile, dm, authOk) {
+    const panel = document.getElementById('profiles-status-panel');
+    if (!panel) return;
+
+    const profileTile = profile
+        ? statusTile({
+            label: 'Active profile',
+            valueHtml: `<strong>${escapeHtml(profile.name || '(unnamed)')}</strong>`,
+            metaLines: [
+                profile.designBaseUrl ? `Design: ${escapeHtml(extractHost(profile.designBaseUrl))}` : null,
+                profile.sandboxBaseUrl ? `Sandbox: ${escapeHtml(extractHost(profile.sandboxBaseUrl))}` : null,
+            ].filter(Boolean),
+            statusDot: 'ok',
+        })
+        : statusTile({
+            label: 'Active profile',
+            valueHtml: `<em>None selected</em>`,
+            metaLines: ['Add or activate a profile below'],
+            statusDot: 'warn',
+        });
+
+    const dmTile = dm
+        ? statusTile({
+            label: 'Data model',
+            valueHtml: `<strong>${dm.tables}</strong> tables · <strong>${dm.columns}</strong> columns`,
+            metaLines: [`${dm.relations} relations · ${formatBytes(dm.sizeBytes)}`],
+            statusDot: 'ok',
+        })
+        : statusTile({
+            label: 'Data model',
+            valueHtml: profile ? '<em>Not uploaded</em>' : '<em>—</em>',
+            metaLines: profile
+                ? ['Edit the active profile to upload dataModel.json']
+                : ['Waiting for a profile'],
+            statusDot: profile ? 'warn' : 'muted',
+        });
+
+    const tokenTile = authOk
+        ? statusTile({
+            label: 'FAWB token',
+            valueHtml: `<strong>Set</strong>`,
+            metaLines: ['Auto-refresh runs at ~90% of token TTL'],
+            statusDot: 'ok',
+        })
+        : statusTile({
+            label: 'FAWB token',
+            valueHtml: `<em>Not set</em>`,
+            metaLines: ['Click the token indicator in the sidebar footer'],
+            statusDot: 'warn',
+        });
+
+    panel.innerHTML = profileTile + dmTile + tokenTile;
+}
+
+function statusTile({ label, valueHtml, metaLines, statusDot }) {
+    const meta = (metaLines || []).map(l => `<div class="home-status-tile-meta">${l}</div>`).join('');
+    return `
+        <div class="home-status-tile home-status-tile-${statusDot}">
+            <div class="home-status-tile-header">
+                <span class="home-status-dot home-status-dot-${statusDot}" aria-hidden="true"></span>
+                <span class="home-status-tile-label">${escapeHtml(label)}</span>
+            </div>
+            <div class="home-status-tile-value">${valueHtml}</div>
+            ${meta}
+        </div>
+    `;
+}
+
+function renderContextCard(profile, dm, authOk) {
+    const el = document.getElementById('profiles-context-card');
+    if (!el) return;
+    el.classList.remove('home-context-card-loading');
+
+    let ctx;
+    if (!profile) {
+        ctx = {
+            kind: 'setup', icon: ctxIconFolder(),
+            title: 'Start by adding a profile',
+            desc: `A profile connects DevBridge to one FAWB project — design and sandbox URLs, DB service name, OAuth credentials. Everything else builds on this.`,
+            ctaLabel: 'Add a profile', ctaAction: 'focus-add',
+        };
+    } else if (!dm) {
+        ctx = {
+            kind: 'setup', icon: ctxIconUpload(),
+            title: `Upload the project's data model`,
+            desc: `<strong>${escapeHtml(profile.name || '(unnamed)')}</strong> is missing its dataModel.json. Import App and DB Explorer both need it to walk the FK graph and render the schema.`,
+            ctaLabel: 'Edit profile to upload', ctaAction: 'edit-active',
+        };
+    } else if (!authOk) {
+        ctx = {
+            kind: 'setup', icon: ctxIconKey(),
+            title: 'Set your FAWB bearer token',
+            desc: `Every FAWB request needs a valid <code>WM_AUTH_TOKEN</code>. If OAuth credentials are set on the profile, we can auto-fetch — otherwise paste one from an active FAWB session.`,
+            ctaLabel: 'Open token modal', ctaAction: 'open-token-modal',
+        };
+    } else {
+        ctx = {
+            kind: 'ready', icon: ctxIconRocket(),
+            title: `Ready — ${escapeHtml(profile.name || '(unnamed)')} is fully configured`,
+            desc: `Data model loaded (${dm.tables} tables), token set. Import an app from design to sandbox, or run ad-hoc SQL to check state.`,
+            ctaLabel: 'Import an app', ctaHref: '#/import-app',
+            ctaSecondaryLabel: 'Run SQL', ctaSecondaryHref: '#/sql-runner',
+        };
+    }
+
+    const secondary = ctx.ctaSecondaryLabel
+        ? `<a href="${ctx.ctaSecondaryHref}" class="btn secondary home-context-cta-secondary">${escapeHtml(ctx.ctaSecondaryLabel)}</a>`
+        : '';
+    const primary = ctx.ctaAction
+        ? `<button class="btn home-context-cta" data-action="${ctx.ctaAction}">${escapeHtml(ctx.ctaLabel)}</button>`
+        : `<a href="${ctx.ctaHref}" class="btn home-context-cta">${escapeHtml(ctx.ctaLabel)}</a>`;
+
+    el.classList.remove('home-context-card-setup', 'home-context-card-ready');
+    el.classList.add(`home-context-card-${ctx.kind}`);
+    el.innerHTML = `
+        <div class="home-context-card-icon">${ctx.icon}</div>
+        <div class="home-context-card-body">
+            <div class="home-context-card-title">${escapeHtml(ctx.title)}</div>
+            <div class="home-context-card-desc">${ctx.desc}</div>
+        </div>
+        <div class="home-context-card-actions">
+            ${primary}
+            ${secondary}
+        </div>
+    `;
+
+    el.querySelectorAll('button[data-action]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const action = btn.dataset.action;
+            if (action === 'open-token-modal') {
+                window.dispatchEvent(new CustomEvent('open-token-modal'));
+            } else if (action === 'focus-add') {
+                document.getElementById('btn-show-add')?.click();
+            } else if (action === 'edit-active') {
+                const p = profilesCache.find(x => x.id === profile.id);
+                if (p) startEdit(p);
+            }
+        });
+    });
+}
+
+function ctxIconFolder() {
+    return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
+}
+function ctxIconUpload() {
+    return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`;
+}
+function ctxIconKey() {
+    return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>`;
+}
+function ctxIconRocket() {
+    return `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></svg>`;
+}

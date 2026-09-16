@@ -1,4 +1,4 @@
-import { planDelete, executeDelete, getActiveProfile } from '../api.js';
+import { planDelete, executeDelete, getActiveProfile, getLatestDeleteJournal } from '../api.js';
 
 const state = {
     profile: null,
@@ -232,38 +232,188 @@ function closeDeleteModal() {
 }
 
 async function runExecuteDelete(appId, confirmToken, lookupColumn) {
-    const doBtn = document.getElementById('btn-do-delete');
-    const cancelBtn = document.getElementById('btn-cancel-delete');
-    doBtn.disabled = true;
-    cancelBtn.disabled = true;
-    doBtn.textContent = 'Deleting…';
+    // Close the confirmation modal and open a live progress panel that
+    // polls the delete journal on disk every second. Mirrors the import UX.
+    closeDeleteModal();
+    openDeleteProgressPanel();
 
+    const started = Date.now();
+    const poller = startDeleteJournalPoller();
     try {
         const journal = await executeDelete({ appId, lookupColumn, confirm: true, confirmToken });
-        closeDeleteModal();
-        renderDeleteResult(journal);
+        const elapsedMs = Date.now() - started;
+        renderDeleteProgressPanel(journal, elapsedMs, /*done=*/ true);
+        renderDeleteResult(journal, elapsedMs);
         const st = journal.status;
         const deletedCount = (journal.entries || []).filter(e => e.result === 'deleted').length;
         const failedCount = (journal.entries || []).filter(e => e.result === 'failed').length;
+        const took = formatDuration(elapsedMs);
         let toastMsg, toastKind;
         if (st === 'success') {
-            toastMsg = `Delete complete — ${deletedCount} row${deletedCount === 1 ? '' : 's'} removed.`;
+            toastMsg = `Delete complete — ${deletedCount} row${deletedCount === 1 ? '' : 's'} removed in ${took}.`;
             toastKind = 'success';
         } else {
-            toastMsg = `Delete halted — ${deletedCount} row${deletedCount === 1 ? '' : 's'} removed, ${failedCount} failed. See details.`;
+            toastMsg = `Delete halted after ${took} — ${deletedCount} row${deletedCount === 1 ? '' : 's'} removed, ${failedCount} failed. See details.`;
             toastKind = 'error';
         }
         (window.showToast || alert)(toastMsg, toastKind, 7000);
     } catch (err) {
-        (window.showToast || alert)('Delete failed: ' + err.message, 'error');
+        const elapsedMs = Date.now() - started;
+        (window.showToast || alert)(`Delete failed after ${formatDuration(elapsedMs)}: ${err.message}`, 'error');
     } finally {
-        doBtn.disabled = false;
-        cancelBtn.disabled = false;
-        doBtn.textContent = 'Delete now';
+        if (poller) clearInterval(poller);
+        if (deleteProgressState.elapsedTimer) {
+            clearInterval(deleteProgressState.elapsedTimer);
+            deleteProgressState.elapsedTimer = null;
+        }
     }
 }
 
-function renderDeleteResult(journal) {
+/* ---------- Live progress panel (polls the delete journal on disk) ---------- */
+
+const deleteProgressState = {
+    startedAt: 0,
+    pollTimer: null,
+    elapsedTimer: null,
+};
+
+function openDeleteProgressPanel() {
+    const container = document.getElementById('execute-results');
+    if (!container) return;
+    deleteProgressState.startedAt = Date.now();
+    const plan = state.lastPlan;
+    const steps = (plan && plan.steps) || [];
+    container.innerHTML = `
+        <div class="import-progress card" id="delete-progress-panel">
+            <div class="import-progress-header">
+                <div>
+                    <h3 style="margin:0">Delete in progress</h3>
+                    <p class="muted" style="margin:4px 0 0 0">
+                        Watching the journal for per-table updates every second.
+                        Children delete first; the root table is last.
+                    </p>
+                </div>
+                <div class="import-progress-stats">
+                    <div><span class="import-progress-num" id="delete-progress-rows-done">0</span> / <span id="delete-progress-rows-total">${plan ? plan.totalRows : 0}</span> rows</div>
+                    <div class="muted"><span id="delete-progress-elapsed">0s</span> elapsed</div>
+                </div>
+            </div>
+            <ol class="import-progress-list" id="delete-progress-list">
+                ${steps.map(s => `
+                    <li class="import-progress-step" data-table="${escapeHtml(s.tableName)}">
+                        <span class="import-progress-icon" data-status="pending">⏳</span>
+                        <span class="import-progress-name">${escapeHtml(s.tableName)}</span>
+                        <span class="import-progress-meta">${s.rowCount} row${s.rowCount === 1 ? '' : 's'} expected</span>
+                    </li>
+                `).join('')}
+            </ol>
+        </div>
+    `;
+    deleteProgressState.elapsedTimer = setInterval(() => {
+        const el = document.getElementById('delete-progress-elapsed');
+        if (el) el.textContent = formatDuration(Date.now() - deleteProgressState.startedAt);
+    }, 500);
+}
+
+function startDeleteJournalPoller() {
+    if (!state.profile || !state.profile.id) return null;
+    const profileId = state.profile.id;
+    const initialTs = deleteProgressState.startedAt;
+    deleteProgressState.pollTimer = setInterval(async () => {
+        try {
+            const journal = await getLatestDeleteJournal(profileId);
+            if (!journal) return;
+            const journalStarted = journal.startedAt ? new Date(journal.startedAt).getTime() : 0;
+            if (journalStarted > 0 && journalStarted + 3000 < initialTs) return;   // stale
+            renderDeleteProgressPanel(journal, Date.now() - deleteProgressState.startedAt, /*done=*/ false);
+        } catch { /* silent — next tick will retry */ }
+    }, 1000);
+    return deleteProgressState.pollTimer;
+}
+
+function renderDeleteProgressPanel(journal, elapsedMs, done) {
+    const list = document.getElementById('delete-progress-list');
+    if (!list || !journal) return;
+
+    const entries = journal.entries || [];
+    const byTable = new Map();
+    for (const e of entries) {
+        if (!e || !e.tableName) continue;
+        const prev = byTable.get(e.tableName) || { deleted: 0, failed: 0, skipped: 0, lastMsg: '' };
+        if (e.result === 'deleted') prev.deleted++;
+        else if (e.result === 'failed') prev.failed++;
+        else if (e.result === 'skipped') prev.skipped++;
+        prev.lastMsg = e.message || '';
+        byTable.set(e.tableName, prev);
+    }
+
+    const lastEntry = entries.length > 0 ? entries[entries.length - 1] : null;
+    const activeTable = done ? null : (lastEntry ? lastEntry.tableName : null);
+
+    let rowsDone = 0;
+    list.querySelectorAll('.import-progress-step').forEach(li => {
+        const tableName = li.dataset.table;
+        const stat = byTable.get(tableName);
+        const iconEl = li.querySelector('.import-progress-icon');
+        const metaEl = li.querySelector('.import-progress-meta');
+        if (!stat) {
+            if (done) {
+                iconEl.textContent = '—';
+                iconEl.dataset.status = 'unreached';
+                metaEl.textContent = 'not reached';
+            } else {
+                iconEl.textContent = '⏳';
+                iconEl.dataset.status = 'pending';
+            }
+            return;
+        }
+        rowsDone += stat.deleted;
+        if (stat.failed > 0) {
+            iconEl.textContent = '✗';
+            iconEl.dataset.status = 'failed';
+            metaEl.textContent = `${stat.deleted} deleted, ${stat.failed} failed`;
+            li.setAttribute('title', stat.lastMsg);
+        } else if (activeTable === tableName) {
+            iconEl.textContent = '↻';
+            iconEl.dataset.status = 'in-progress';
+            metaEl.textContent = `${stat.deleted} deleted…`;
+        } else {
+            iconEl.textContent = '✓';
+            iconEl.dataset.status = 'done';
+            metaEl.textContent = `${stat.deleted} deleted`;
+        }
+    });
+
+    const rowsDoneEl = document.getElementById('delete-progress-rows-done');
+    if (rowsDoneEl) rowsDoneEl.textContent = rowsDone;
+    const elapsedEl = document.getElementById('delete-progress-elapsed');
+    if (elapsedEl && done) {
+        elapsedEl.textContent = formatDuration(elapsedMs);
+        if (deleteProgressState.elapsedTimer) {
+            clearInterval(deleteProgressState.elapsedTimer);
+            deleteProgressState.elapsedTimer = null;
+        }
+    }
+    if (done && deleteProgressState.pollTimer) {
+        clearInterval(deleteProgressState.pollTimer);
+        deleteProgressState.pollTimer = null;
+    }
+}
+
+/** Format a millisecond count as "823 ms", "4.2s", "3m 12s", "1h 4m 12s". */
+function formatDuration(ms) {
+    if (ms == null || ms < 0) return '—';
+    if (ms < 1000) return `${ms} ms`;
+    const totalSec = Math.round(ms / 1000);
+    if (totalSec < 60) return `${(ms / 1000).toFixed(1)}s`;
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    return `${m}m ${s}s`;
+}
+
+function renderDeleteResult(journal, elapsedMs) {
     const el = document.getElementById('execute-results');
     if (!el || !journal) return;
     const statusClass = journal.status === 'success' ? 'success'
@@ -272,6 +422,9 @@ function renderDeleteResult(journal) {
     const deletedRows = (journal.entries || []).filter(e => e.result === 'deleted').length;
     const failRows = (journal.entries || []).filter(e => e.result === 'failed').length;
     const skipRows = (journal.entries || []).filter(e => e.result === 'skipped').length;
+    const durationPart = typeof elapsedMs === 'number'
+        ? ` &middot; elapsed <strong>${formatDuration(elapsedMs)}</strong>`
+        : '';
     el.innerHTML = `
         <div class="execute-summary card">
             <h3 style="margin-top:0">Delete result — ${escapeHtml(journal.status || 'unknown')}</h3>
@@ -281,7 +434,7 @@ function renderDeleteResult(journal) {
             <div class="execute-summary-line">
                 <strong>${deletedRows}</strong> row${deletedRows === 1 ? '' : 's'} deleted
                 &middot; <strong>${failRows}</strong> failed
-                ${skipRows > 0 ? `&middot; <strong>${skipRows}</strong> skipped` : ''}
+                ${skipRows > 0 ? `&middot; <strong>${skipRows}</strong> skipped` : ''}${durationPart}
                 &middot; job <code>${escapeHtml(journal.jobId || '')}</code>
             </div>
             <details>

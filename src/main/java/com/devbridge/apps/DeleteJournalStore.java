@@ -40,6 +40,32 @@ public class DeleteJournalStore {
         }
     }
 
+    /**
+     * Read the most recent delete journal on disk for the given profile.
+     * Used by the frontend to poll live progress while a delete is running.
+     */
+    public java.util.Optional<DeleteJournal> readLatest(String profileId) {
+        if (profileId == null || profileId.isBlank()) return java.util.Optional.empty();
+        Path dir = root.resolve(profileId);
+        if (!Files.isDirectory(dir)) return java.util.Optional.empty();
+        try (var stream = Files.list(dir)) {
+            return stream
+                    .filter(p -> p.getFileName().toString().endsWith(".json"))
+                    .max(java.util.Comparator.comparing(p -> p.getFileName().toString()))
+                    .flatMap(p -> {
+                        try {
+                            return java.util.Optional.of(mapper.readValue(p.toFile(), DeleteJournal.class));
+                        } catch (IOException e) {
+                            log.debug("Failed to read delete journal {}: {}", p, e.getMessage());
+                            return java.util.Optional.empty();
+                        }
+                    });
+        } catch (IOException e) {
+            log.debug("Failed to list delete journals for {}: {}", profileId, e.getMessage());
+            return java.util.Optional.empty();
+        }
+    }
+
     /** Write (or overwrite) the given journal to its per-profile file. Returns the absolute path. */
     public Path write(DeleteJournal journal) {
         if (journal == null || journal.profileId() == null || journal.jobId() == null) {

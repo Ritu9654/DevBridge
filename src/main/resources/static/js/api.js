@@ -1,5 +1,15 @@
 // Thin wrapper around fetch() for calls to our Spring Boot backend.
 // All backend endpoints live under /api.
+//
+// Profile CRUD is now browser-local: `listProfiles`, `getActiveProfile`,
+// `createProfile`, `updateProfile`, `deleteProfile`, `activateProfile`
+// are re-exported from `profileStorage.js` and never round-trip to the
+// server. Each user's browser is the tenancy boundary.
+//
+// FAWB-hitting operations (SQL execute, import, delete, dataModel, auth)
+// continue to hit the server, which forwards to FAWB.
+
+import * as profileStorage from './profileStorage.js';
 
 const BASE = '/api';
 
@@ -18,8 +28,9 @@ async function request(path, options = {}) {
         // Prefer a friendly error field from the body if the backend returned JSON.
         const bodyText = await res.text();
         let message = `${res.status} ${res.statusText}`;
+        let parsed = null;
         try {
-            const parsed = JSON.parse(bodyText);
+            parsed = JSON.parse(bodyText);
             if (parsed && typeof parsed.error === 'string' && parsed.error.trim()) {
                 message = parsed.error;
             } else if (parsed && typeof parsed.message === 'string' && parsed.message.trim()) {
@@ -31,7 +42,12 @@ async function request(path, options = {}) {
             // Body isn't JSON — fall back to the raw text
             if (bodyText) message = `${res.status} ${res.statusText}: ${bodyText}`;
         }
-        throw new Error(message);
+        // Attach the HTTP status + parsed body to the Error so callers can
+        // branch on specific server codes (e.g. APP_ALREADY_EXISTS).
+        const err = new Error(message);
+        err.status = res.status;
+        err.body = parsed;
+        throw err;
     }
     const contentType = res.headers.get('content-type') || '';
     return contentType.includes('application/json') ? res.json() : res.text();
@@ -100,30 +116,33 @@ export async function restoreTokenToBackend(profileId, token) {
     });
 }
 
-/* Profiles */
-export function listProfiles() {
-    return request('/profiles');
-}
-export function getActiveProfile() {
-    return request('/profiles/active'); // returns null on 204
-}
-export function createProfile(profile) {
-    return request('/profiles', { method: 'POST', body: JSON.stringify(profile) });
-}
-export function updateProfile(id, profile) {
-    return request(`/profiles/${encodeURIComponent(id)}`, {
-        method: 'PUT',
-        body: JSON.stringify(profile),
+/* Profiles — browser-local (localStorage). See profileStorage.js. */
+export const listProfiles = profileStorage.listProfiles;
+export const getActiveProfile = profileStorage.getActiveProfile;
+export const createProfile = profileStorage.createProfile;
+export const updateProfile = profileStorage.updateProfile;
+export const deleteProfile = profileStorage.deleteProfile;
+export const activateProfile = profileStorage.activateProfile;
+export const exportProfilesToJson = profileStorage.exportAllToJson;
+export const importProfilesFromJson = profileStorage.importFromJson;
+
+/**
+ * Test connection to a profile's FAWB envs. Server-hit endpoint because
+ * the actual network probe must happen from the server (browser can't
+ * bypass CORS to FAWB). Sends the full profile in the body so the
+ * server doesn't need to look it up.
+ */
+export async function testConnection(profile) {
+    const res = await fetch(`${BASE}/profiles/test-connection`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile }),
     });
-}
-export function deleteProfile(id) {
-    return request(`/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
-}
-export function activateProfile(id) {
-    return request(`/profiles/${encodeURIComponent(id)}/activate`, { method: 'POST' });
-}
-export function testConnection(id) {
-    return request(`/profiles/${encodeURIComponent(id)}/test-connection`, { method: 'POST' });
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+    }
+    return res.json();
 }
 
 /* SQL execution */
@@ -189,6 +208,27 @@ export function executeImport({ appId, lookupColumn, sourceEnv, targetEnv, confi
         method: 'POST',
         body: JSON.stringify(body),
     });
+}
+
+/** Poll the latest import journal on disk for the given profile. Used during
+ *  execute to render per-table progress. Returns null when there's no journal
+ *  yet (executor hasn't written anything). */
+export async function getLatestImportJournal(profileId) {
+    if (!profileId) return null;
+    const res = await fetch(`${BASE}/apps/import-journal/latest?profileId=${encodeURIComponent(profileId)}`);
+    if (res.status === 204) return null;
+    if (!res.ok) return null;
+    return res.json();
+}
+
+/** Poll the latest delete journal on disk for the given profile. Used during
+ *  execute-delete to render per-table progress. */
+export async function getLatestDeleteJournal(profileId) {
+    if (!profileId) return null;
+    const res = await fetch(`${BASE}/apps/delete-journal/latest?profileId=${encodeURIComponent(profileId)}`);
+    if (res.status === 204) return null;
+    if (!res.ok) return null;
+    return res.json();
 }
 
 /* App delete (Module 3-adjacent) — reverse FK-graph walk in sandbox */

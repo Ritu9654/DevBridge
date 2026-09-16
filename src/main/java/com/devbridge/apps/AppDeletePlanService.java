@@ -46,6 +46,7 @@ public class AppDeletePlanService {
 
         FkGraph graph = fetch.graph();
         Set<String> refSet = normaliseReferences(profile.referenceTables());
+        Set<String> orphanTables = fetch.orphanTables() != null ? fetch.orphanTables() : Collections.emptySet();
 
         List<String> subset = new ArrayList<>(fetch.rowsByTable().keySet());
         FkGraph.TopoResult topo = graph.topoSort(subset);
@@ -58,6 +59,27 @@ public class AppDeletePlanService {
         // Reverse the topo order: children (leaves) first, root last.
         List<String> deleteOrder = new ArrayList<>(topo.ordered());
         Collections.reverse(deleteOrder);
+
+        // Hoist orphan tables to the front of the delete order.
+        // Rationale: orphans were discovered via column-name match, not via
+        // the dataModel's declared FK graph, so the topological sort has no
+        // information about their real-world FK relationships. But at the DB
+        // level, an orphan often IS a child of a walked table — e.g.,
+        // AuditDataChange has a real FK to APPLICATION even though the
+        // dataModel doesn't declare it. Deleting the orphan first is always
+        // safe: nothing walked-via-FK references it (otherwise it'd be in
+        // the FK graph), so hoisting it can't break anything.
+        if (!orphanTables.isEmpty()) {
+            List<String> orphansInOrder = new ArrayList<>();
+            List<String> nonOrphansInOrder = new ArrayList<>();
+            for (String t : deleteOrder) {
+                if (orphanTables.contains(FkGraph.norm(t))) orphansInOrder.add(t);
+                else nonOrphansInOrder.add(t);
+            }
+            deleteOrder.clear();
+            deleteOrder.addAll(orphansInOrder);
+            deleteOrder.addAll(nonOrphansInOrder);
+        }
 
         Set<String> cyclicSet = new HashSet<>(topo.cyclic());
         int order = 0;
@@ -78,7 +100,9 @@ public class AppDeletePlanService {
             }
 
             String notes;
-            if (cyclicSet.contains(tableName)) {
+            if (orphanTables.contains(FkGraph.norm(tableName))) {
+                notes = "Orphan match — not FK-linked to the root but has a column matching the filter. Deleted here to avoid stale data.";
+            } else if (cyclicSet.contains(tableName)) {
                 notes = "Cyclic — order within group is arbitrary; FK constraints may need attention.";
             } else if (FkGraph.norm(tableName).equals(FkGraph.norm(profile.rootTableName()))) {
                 notes = "Root table — deleted last.";

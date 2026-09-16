@@ -7,7 +7,6 @@ import { bulkImportView } from './views/bulk-import.js';
 import { deleteAppView } from './views/delete-app.js';
 import { dbExplorerView } from './views/db-explorer.js';
 import { profilesView } from './views/profiles.js';
-import { settingsView } from './views/settings.js';
 
 export const routes = {
     '/': homeView,
@@ -17,5 +16,4 @@ export const routes = {
     '/delete-app': deleteAppView,
     '/db-explorer': dbExplorerView,
     '/profiles': profilesView,
-    '/settings': settingsView,
 };

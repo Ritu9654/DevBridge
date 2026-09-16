@@ -5,6 +5,7 @@ import com.devbridge.apps.AppDeletePlanService;
 import com.devbridge.apps.AppSqlFetchService;
 import com.devbridge.apps.AppSqlFetchService.FetchResult;
 import com.devbridge.apps.DeleteJournal;
+import com.devbridge.apps.DeleteJournalStore;
 import com.devbridge.apps.DeletePlan;
 import com.devbridge.datamodel.DataModel;
 import com.devbridge.datamodel.DataModelService;
@@ -41,19 +42,35 @@ public class AppDeleteController {
     private final AppSqlFetchService fetchService;
     private final AppDeletePlanService planService;
     private final AppDeleteExecutorService executorService;
+    private final DeleteJournalStore journalStore;
 
     public AppDeleteController(ProfileService profileService,
                                ActiveProfileHolder activeProfileHolder,
                                DataModelService dataModelService,
                                AppSqlFetchService fetchService,
                                AppDeletePlanService planService,
-                               AppDeleteExecutorService executorService) {
+                               AppDeleteExecutorService executorService,
+                               DeleteJournalStore journalStore) {
         this.profileService = profileService;
         this.activeProfileHolder = activeProfileHolder;
         this.dataModelService = dataModelService;
         this.fetchService = fetchService;
         this.planService = planService;
         this.executorService = executorService;
+        this.journalStore = journalStore;
+    }
+
+    /**
+     * Live-progress endpoint: returns the most recent delete journal for the
+     * given profile. Client polls this every ~1s during an execute-delete
+     * request so the user sees per-table progress as it happens.
+     */
+    @org.springframework.web.bind.annotation.GetMapping("/delete-journal/latest")
+    public ResponseEntity<?> latestJournal(
+            @org.springframework.web.bind.annotation.RequestParam("profileId") String profileId) {
+        return journalStore.readLatest(profileId)
+                .map(j -> ResponseEntity.ok((Object) j))
+                .orElseGet(() -> ResponseEntity.noContent().build());
     }
 
     /**
@@ -71,7 +88,8 @@ public class AppDeleteController {
             FetchResult fetch = fetchService.fetch(
                     p.profile, DELETE_ENV, p.dataModel,
                     p.profile.rootTableName(), filterCol,
-                    req.appId().trim(), p.profile.referenceTables());
+                    req.appId().trim(), p.profile.referenceTables(),
+                    /*scanOrphans=*/ true);
             DeletePlan plan = planService.build(fetch, p.profile, DELETE_ENV, req.appId().trim());
             return ResponseEntity.ok(plan);
         } catch (IllegalStateException | IllegalArgumentException e) {
@@ -106,7 +124,8 @@ public class AppDeleteController {
             FetchResult fetch = fetchService.fetch(
                     p.profile, DELETE_ENV, p.dataModel,
                     p.profile.rootTableName(), filterCol,
-                    req.appId().trim(), p.profile.referenceTables());
+                    req.appId().trim(), p.profile.referenceTables(),
+                    /*scanOrphans=*/ true);
             DeleteJournal journal = executorService.execute(
                     fetch, p.profile, DELETE_ENV, req.appId().trim());
             return ResponseEntity.ok(journal);
