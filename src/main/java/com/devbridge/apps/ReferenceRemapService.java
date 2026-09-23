@@ -26,6 +26,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Populates the executor's {@code idMap} with source → target mappings for
@@ -189,25 +194,61 @@ public class ReferenceRemapService {
                                   Map<String, ReferenceTableConfig> configs,
                                   ProjectProfile profile, String targetEnv,
                                   Map<String, Map<Object, Object>> idMap) throws Exception {
-        StringBuilder log_ = new StringBuilder();
+        record SentTask(String tableName, DataModel.Table table, String pkCol, String activeClause) {}
+        record SentResult(SentTask task, Object id) {}
+
+        List<SentTask> tasks = new ArrayList<>();
         for (String tableName : tables) {
             DataModel.Table table = graph.table(tableName).orElse(null);
             if (table == null) continue;
             String pkCol = primaryKeyColumn(table);
             String activeClause = pickActiveClause(table, configs.get(tableName));
+            tasks.add(new SentTask(tableName, table, pkCol, activeClause));
+        }
+        if (tasks.isEmpty()) return;
 
-            Object id = fetchOneRowId(profile, targetEnv, table.name(), pkCol, activeClause);
-            if (id == null && activeClause != null) {
-                // No active row — try again with no filter.
-                id = fetchOneRowId(profile, targetEnv, table.name(), pkCol, null);
+        List<SentResult> results;
+        if (tasks.size() == 1) {
+            SentTask t = tasks.get(0);
+            Object id = fetchOneRowId(profile, targetEnv, t.table().name(), t.pkCol(), t.activeClause());
+            if (id == null && t.activeClause() != null)
+                id = fetchOneRowId(profile, targetEnv, t.table().name(), t.pkCol(), null);
+            results = List.of(new SentResult(t, id));
+        } else {
+            int nThreads = Math.min(6, tasks.size());
+            AtomicInteger threadId = new AtomicInteger();
+            ExecutorService pool = Executors.newFixedThreadPool(nThreads, r -> {
+                Thread th = new Thread(r, "devbridge-remap-sentinel-" + threadId.incrementAndGet());
+                th.setDaemon(true);
+                return th;
+            });
+            List<Future<SentResult>> futures = new ArrayList<>(tasks.size());
+            for (SentTask t : tasks) {
+                futures.add(pool.submit(() -> {
+                    Object id = fetchOneRowId(profile, targetEnv, t.table().name(), t.pkCol(), t.activeClause());
+                    if (id == null && t.activeClause() != null)
+                        id = fetchOneRowId(profile, targetEnv, t.table().name(), t.pkCol(), null);
+                    return new SentResult(t, id);
+                }));
             }
-            if (id == null) {
-                throw new RemapException("Sentinel resolution [" + tableName + "]: target has 0 rows. "
+            pool.shutdown();
+            results = new ArrayList<>(tasks.size());
+            try {
+                for (Future<SentResult> f : futures) results.add(unwrap(f));
+            } finally {
+                pool.shutdownNow();
+            }
+        }
+
+        StringBuilder log_ = new StringBuilder();
+        for (SentResult r : results) {
+            if (r.id() == null) {
+                throw new RemapException("Sentinel resolution [" + r.task().tableName() + "]: target has 0 rows. "
                         + "Cannot substitute audit-column FKs. Seed at least one row in the target table.");
             }
-            idMap.computeIfAbsent(tableName, k -> new LinkedHashMap<>()).put(SENTINEL_KEY, id);
-            log_.append(tableName).append("=").append(id)
-                .append(activeClause != null ? " (active)" : "")
+            idMap.computeIfAbsent(r.task().tableName(), k -> new LinkedHashMap<>()).put(SENTINEL_KEY, r.id());
+            log_.append(r.task().tableName()).append("=").append(r.id())
+                .append(r.task().activeClause() != null ? " (active)" : "")
                 .append("  ");
         }
         log.info("Sentinel remap: audit-column FKs will use — {}", log_.toString().trim());
@@ -316,44 +357,76 @@ public class ReferenceRemapService {
             Map<String, ReferenceTableConfig> configs,
             FkGraph graph, ProjectProfile profile, String sourceEnv) throws Exception {
         Map<String, Map<Object, Map<String, Object>>> cache = new LinkedHashMap<>();
+        record SrcTask(String refTable, DataModel.Table table, ReferenceTableConfig cfg, Set<Object> missing) {}
+        record SrcResult(SrcTask task, List<Map<String, Object>> rows) {}
         boolean changed = true;
         while (changed) {
             changed = false;
-            // Snapshot to avoid concurrent modification during the pass.
             List<Map.Entry<String, Set<Object>>> pending = new ArrayList<>(needIds.entrySet());
+
+            // Build per-table fetch tasks — only tables with uncached IDs need an HTTP call.
+            List<SrcTask> tasks = new ArrayList<>();
             for (Map.Entry<String, Set<Object>> entry : pending) {
                 String refTable = entry.getKey();
                 Set<Object> ids = entry.getValue();
                 Map<Object, Map<String, Object>> already = cache.computeIfAbsent(refTable, k -> new LinkedHashMap<>());
-                // Normalise to String for the already-seen check: JSON may return Integer/Long
-                // while the FK value in the app row was a String (or vice-versa). A strict
-                // equals-based containsKey miss causes the same IDs to be re-fetched on every
-                // fixed-point iteration, turning O(N) HTTP calls into O(N²).
+                // Normalise to String: JSON may return Integer/Long while the FK value in the app
+                // row is a String (or vice-versa); strict containsKey misses cause O(N²) re-fetches.
                 Set<String> alreadyNorm = new HashSet<>();
                 for (Object k : already.keySet()) alreadyNorm.add(String.valueOf(k));
                 Set<Object> missing = new LinkedHashSet<>();
                 for (Object id : ids) if (!alreadyNorm.contains(String.valueOf(id))) missing.add(id);
                 if (missing.isEmpty()) continue;
-
-                ReferenceTableConfig cfg = configs.get(refTable);
                 DataModel.Table table = graph.table(refTable).orElseThrow(() ->
                         new RemapException("Reference table '" + refTable + "' missing from dataModel."));
-                List<Map<String, Object>> fetched = batchFetchByIn(profile, sourceEnv, table.name(),
-                        primaryKeyColumn(table), missing);
-                for (Map<String, Object> row : fetched) {
-                    Object pk = lookupCaseInsensitive(row, primaryKeyColumn(table));
+                tasks.add(new SrcTask(refTable, table, configs.get(refTable), missing));
+            }
+            if (tasks.isEmpty()) continue;
+            changed = true;
+
+            // Fire all source-side fetches in parallel — each is an independent SELECT.
+            List<SrcResult> results;
+            if (tasks.size() == 1) {
+                SrcTask t = tasks.get(0);
+                results = List.of(new SrcResult(t, batchFetchByIn(profile, sourceEnv,
+                        t.table().name(), primaryKeyColumn(t.table()), t.missing())));
+            } else {
+                int nThreads = Math.min(6, tasks.size());
+                AtomicInteger threadId = new AtomicInteger();
+                ExecutorService pool = Executors.newFixedThreadPool(nThreads, r -> {
+                    Thread th = new Thread(r, "devbridge-remap-src-" + threadId.incrementAndGet());
+                    th.setDaemon(true);
+                    return th;
+                });
+                List<Future<SrcResult>> futures = new ArrayList<>(tasks.size());
+                for (SrcTask t : tasks) {
+                    futures.add(pool.submit(() -> new SrcResult(t, batchFetchByIn(profile, sourceEnv,
+                            t.table().name(), primaryKeyColumn(t.table()), t.missing()))));
+                }
+                pool.shutdown();
+                results = new ArrayList<>(tasks.size());
+                try {
+                    for (Future<SrcResult> f : futures) results.add(unwrap(f));
+                } finally {
+                    pool.shutdownNow();
+                }
+            }
+
+            // Merge results into cache and expand needIds for transitive FK discovery.
+            for (SrcResult r : results) {
+                Map<Object, Map<String, Object>> already = cache.get(r.task().refTable());
+                String pkCol = primaryKeyColumn(r.task().table());
+                for (Map<String, Object> row : r.rows()) {
+                    Object pk = lookupCaseInsensitive(row, pkCol);
                     if (pk != null) already.put(pk, row);
                 }
-                changed = true;
-
-                // Add any natural-key FK values to needIds for their target tables.
-                for (String col : cfg.naturalKey()) {
-                    String fkTarget = fkTargetOfColumn(table, col, graph);
+                for (String col : r.task().cfg().naturalKey()) {
+                    String fkTarget = fkTargetOfColumn(r.task().table(), col, graph);
                     if (fkTarget == null) continue;
                     String fkTargetNorm = FkGraph.norm(fkTarget);
                     if (!configs.containsKey(fkTargetNorm)) continue;
                     Set<Object> upstream = needIds.computeIfAbsent(fkTargetNorm, k -> new LinkedHashSet<>());
-                    for (Map<String, Object> row : fetched) {
+                    for (Map<String, Object> row : r.rows()) {
                         Object v = lookupCaseInsensitive(row, col);
                         if (v != null) upstream.add(v);
                     }
@@ -462,12 +535,13 @@ public class ReferenceRemapService {
             naturalKeyOfSourceId.put(sourceId, fullKey);
         }
 
-        // For each group, issue a target-side SELECT and collect target rows.
-        // Map: naturalKeyTuple → targetId.
-        Map<List<Object>, Object> targetByKey = new HashMap<>();
+        // Build all (leading, sql) target queries up-front, then fire them in parallel.
+        // Each group × chunk combination is an independent target-side read.
+        record TgtQuery(List<Object> leading, String sql) {}
+        record TgtResult(List<Object> leading, List<Map<String, Object>> rows) {}
+        List<TgtQuery> tgtQueries = new ArrayList<>();
         for (Map.Entry<List<Object>, List<Map<String, Object>>> group : byLeadingKey.entrySet()) {
             List<Object> leading = group.getKey();
-            // Collect distinct last-column values across this group.
             Set<Object> lastValues = new LinkedHashSet<>();
             for (Map<String, Object> row : group.getValue()) {
                 Object lastVal = lookupCaseInsensitive(row, lastKeyCol);
@@ -475,13 +549,43 @@ public class ReferenceRemapService {
                 if (lastVal != null) lastValues.add(lastVal);
             }
             if (lastValues.isEmpty()) continue;
-
             for (List<Object> chunkLast : chunkList(new ArrayList<>(lastValues), MAX_IDS_PER_CHUNK)) {
                 String sql = buildTargetLookupSql(table.name(), naturalKey, leadingKeyCols, leading,
                         lastKeyCol, chunkLast, cfg.activeFilter());
-                List<Map<String, Object>> targetRows = runSelect(profile, targetEnv, sql);
-                for (Map<String, Object> tRow : targetRows) {
-                    List<Object> key = new ArrayList<>(leading);
+                tgtQueries.add(new TgtQuery(leading, sql));
+            }
+        }
+
+        Map<List<Object>, Object> targetByKey = new HashMap<>();
+        if (!tgtQueries.isEmpty()) {
+            List<TgtResult> tgtResults;
+            if (tgtQueries.size() == 1) {
+                TgtQuery q = tgtQueries.get(0);
+                tgtResults = List.of(new TgtResult(q.leading(), runSelect(profile, targetEnv, q.sql())));
+            } else {
+                int nThreads = Math.min(8, tgtQueries.size());
+                AtomicInteger threadId = new AtomicInteger();
+                ExecutorService pool = Executors.newFixedThreadPool(nThreads, r -> {
+                    Thread th = new Thread(r, "devbridge-remap-tgt-" + threadId.incrementAndGet());
+                    th.setDaemon(true);
+                    return th;
+                });
+                List<Future<TgtResult>> futures = new ArrayList<>(tgtQueries.size());
+                for (TgtQuery q : tgtQueries) {
+                    futures.add(pool.submit(() ->
+                            new TgtResult(q.leading(), runSelect(profile, targetEnv, q.sql()))));
+                }
+                pool.shutdown();
+                tgtResults = new ArrayList<>(tgtQueries.size());
+                try {
+                    for (Future<TgtResult> f : futures) tgtResults.add(unwrap(f));
+                } finally {
+                    pool.shutdownNow();
+                }
+            }
+            for (TgtResult r : tgtResults) {
+                for (Map<String, Object> tRow : r.rows()) {
+                    List<Object> key = new ArrayList<>(r.leading());
                     Object lv = lookupCaseInsensitive(tRow, lastKeyCol);
                     if (lv == null) continue;
                     key.add(lv);
@@ -711,6 +815,19 @@ public class ReferenceRemapService {
 
     private static String trunc(String s) {
         return s == null ? "" : (s.length() > 8000 ? s.substring(0, 8000) + "…(+" + (s.length() - 8000) + " chars)" : s);
+    }
+
+    private static <T> T unwrap(Future<T> f) throws Exception {
+        try {
+            return f.get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception ex) throw ex;
+            throw new RuntimeException(cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw e;
+        }
     }
 
     /** Raised for any invalid config or unresolvable reference. */
