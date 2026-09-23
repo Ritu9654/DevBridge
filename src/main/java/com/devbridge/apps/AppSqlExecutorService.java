@@ -392,11 +392,11 @@ public class AppSqlExecutorService {
         boolean needsPreClean = "assigned".equalsIgnoreCase(pol.pkStrategy)
                 && primaryPk != null && !pkStripped && pol.uuidPkColumnsLower.isEmpty();
 
-        // Post-insert verification flag — after every SQL batch, do a
-        // COUNT(*) query to confirm the rows actually landed. Catches the
-        // "server responds success but nothing committed" case that would
-        // otherwise cause downstream FK failures with no clear cause.
-        final boolean verifyAfterInsert = true;
+        // Post-insert verification: disabled by default because the extra
+        // SELECT COUNT(*) per batch doubles HTTP round-trips for assigned-PK tables
+        // and dominates import time. Re-enable here if you see silent FAWB phantom
+        // successes ("created" journal entries but row not in target).
+        final boolean verifyAfterInsert = false;
 
         int i = 0;
         while (i < prepared.size()) {

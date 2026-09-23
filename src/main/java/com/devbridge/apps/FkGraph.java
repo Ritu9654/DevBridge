@@ -265,6 +265,50 @@ public final class FkGraph {
         public boolean hasCycles() { return cyclic != null && !cyclic.isEmpty(); }
     }
 
+    /**
+     * Same as {@link #topoSort} but returns tables grouped by FK depth level.
+     * All tables within the same level have no FK dependency on each other and
+     * can be inserted in parallel. The last entry contains any cyclic tables.
+     */
+    public List<List<String>> topoLevels(Collection<String> subset) {
+        Set<String> normSubset = new LinkedHashSet<>();
+        for (String s : subset) if (s != null) normSubset.add(norm(s));
+
+        Map<String, Integer> indegree = new HashMap<>();
+        for (String t : normSubset) indegree.put(t, 0);
+        for (String t : normSubset) {
+            for (Edge e : parents(t)) {
+                if (normSubset.contains(e.parentTable()) && !e.parentTable().equals(t)) {
+                    indegree.merge(t, 1, Integer::sum);
+                }
+            }
+        }
+
+        List<List<String>> levels = new ArrayList<>();
+        Set<String> emitted = new HashSet<>();
+        List<String> current = new ArrayList<>();
+        for (String t : normSubset) if (indegree.get(t) == 0) current.add(t);
+
+        while (!current.isEmpty()) {
+            levels.add(new ArrayList<>(current));
+            for (String t : current) emitted.add(t);
+            List<String> next = new ArrayList<>();
+            for (String t : current) {
+                for (Edge e : children(t)) {
+                    if (!normSubset.contains(e.childTable())) continue;
+                    if (e.childTable().equals(t)) continue;
+                    int deg = indegree.merge(e.childTable(), -1, Integer::sum);
+                    if (deg == 0 && !emitted.contains(e.childTable())) next.add(e.childTable());
+                }
+            }
+            current = next;
+        }
+        List<String> cyclic = new ArrayList<>();
+        for (String t : normSubset) if (!emitted.contains(t)) cyclic.add(t);
+        if (!cyclic.isEmpty()) levels.add(cyclic);
+        return levels;
+    }
+
     /* ---------- helpers ---------- */
 
     private static boolean isFkRelation(String cardinality) {
