@@ -1,4 +1,4 @@
-import { executeSql, getActiveProfile, listDataModelTables, getDataModelTable } from '../api.js';
+import { executeSql, getActiveProfile, listDataModelTables, getDataModelTable, updateCell } from '../api.js';
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 250];
 const DEFAULT_PAGE_SIZE = 50;
@@ -32,6 +32,11 @@ function readHistory() {
 }
 function pushHistory(entry) {
     const list = readHistory();
+    const normSql = (entry.sql || '').trim().replace(/\s+/g, ' ');
+    // Deduplicate: move an identical sql+env to the top rather than storing twice
+    const dupeIdx = list.findIndex(x =>
+        (x.sql || '').trim().replace(/\s+/g, ' ') === normSql && x.env === entry.env);
+    if (dupeIdx !== -1) list.splice(dupeIdx, 1);
     list.unshift({ ...entry, ts: Date.now() });
     if (list.length > HISTORY_CAP) list.length = HISTORY_CAP;
     try { localStorage.setItem(HISTORY_KEY, JSON.stringify(list)); } catch { /* full — ignore */ }
@@ -70,8 +75,8 @@ function uuidLike() {
 /* ---------- Draft auto-save (survives page refresh) ---------- */
 const DRAFT_KEY = 'devbridge.sql.draft';
 
-function saveDraft(sql, env) {
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ sql, env, ts: Date.now() })); }
+function saveDraft(sql, env, label) {
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ sql, env, label: label || '', ts: Date.now() })); }
     catch { /* full — ignore */ }
 }
 function restoreDraft(textareaEl, envSelectEl) {
@@ -87,11 +92,14 @@ function restoreDraft(textareaEl, envSelectEl) {
         const opt = [...envSelectEl.options].find(o => o.value === draft.env);
         if (opt) envSelectEl.value = draft.env;
     }
+    const labelEl = document.getElementById('sql-run-label');
+    if (labelEl && draft.label) labelEl.value = draft.label;
 }
 
 /* ---------- Autocomplete (tables + columns from dataModel) ---------- */
 const autocompleteState = {
-    items: [],      // { name, kind: 'table' | 'column', hint?: string }
+    items: [],           // { name, kind: 'table' | 'column' | 'keyword', hint?: string }
+    columnsByTable: new Map(),  // upperTableName → string[] — used to scope column suggestions
     open: false,
     index: 0,
     matches: [],
@@ -105,20 +113,35 @@ async function loadAutocompleteData(profileId) {
     if (!Array.isArray(summaries)) return;
     const items = [];
     const seenCols = new Set();
+    autocompleteState.columnsByTable.clear();
     for (const t of summaries) {
         if (!t || !t.name) continue;
         items.push({ name: t.name, kind: 'table', hint: t.entityName && t.entityName !== t.name ? t.entityName : '' });
         if (Array.isArray(t.columnNames)) {
+            // Build per-table column lookup (used to scope suggestions to query tables)
+            autocompleteState.columnsByTable.set(t.name.toUpperCase(), t.columnNames.filter(Boolean));
             for (const col of t.columnNames) {
                 if (!col) continue;
-                // De-dup column names (they appear in multiple tables). Attach
-                // the first table we see it in as a hint for the user.
+                // De-dup column names across tables for the global fallback list.
+                // Hint shows the first table we encounter this column in.
                 if (!seenCols.has(col.toLowerCase())) {
                     seenCols.add(col.toLowerCase());
                     items.push({ name: col, kind: 'column', hint: t.name });
                 }
             }
         }
+    }
+    // SQL keyword completions — shown only when context is 'keyword'
+    const SQL_KEYWORDS = [
+        'SELECT', 'FROM', 'WHERE', 'JOIN', 'ON', 'AND', 'OR', 'NOT',
+        'IN', 'LIKE', 'BETWEEN', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT', 'AS',
+        'UPDATE', 'INSERT', 'DELETE', 'VALUES', 'SET', 'UNION', 'INTO',
+        'COUNT', 'SUM', 'MAX', 'MIN', 'AVG', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
+        'NULL', 'TRUE', 'FALSE', 'ORDER', 'GROUP', 'INNER', 'LEFT', 'RIGHT',
+        'FULL', 'CROSS', 'EXISTS', 'ALL', 'ANY', 'EXCEPT', 'INTERSECT',
+    ];
+    for (const kw of SQL_KEYWORDS) {
+        items.push({ name: kw, kind: 'keyword' });
     }
     autocompleteState.items = items;
 }
@@ -136,6 +159,69 @@ function currentWord(textarea) {
     let end = caret;
     while (end < val.length && isIdentChar(val[end])) end++;
     return { text: val.slice(start, end), start, end };
+}
+
+/**
+ * Extract table names referenced in FROM / JOIN / UPDATE clauses of a SQL string.
+ * Used to scope column suggestions to only tables present in the current query.
+ */
+function extractTablesFromSql(sql) {
+    // Strip string literals and comments before scanning
+    let s = sql
+        .replace(/'(?:[^'\\]|\\.)*'/g, ' ')
+        .replace(/"(?:[^"\\]|\\.)*"/g, ' ')
+        .replace(/--[^\n]*/g, ' ')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ');
+    const tables = [];
+    // FROM tableName  /  any JOIN tableName  (no alias tracking — simple case)
+    const fromJoin = /\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)/gi;
+    let m;
+    while ((m = fromJoin.exec(s)) !== null) tables.push(m[1]);
+    // UPDATE tableName SET …
+    const upd = /\bUPDATE\s+([A-Za-z_][A-Za-z0-9_]*)/gi;
+    while ((m = upd.exec(s)) !== null) tables.push(m[1]);
+    return [...new Set(tables)];
+}
+
+/**
+ * Detect the autocomplete context at the cursor position.
+ * Returns: 'table' | 'column' | 'keyword' | 'any'
+ *
+ * 'table'   — after FROM / JOIN / UPDATE / INTO
+ * 'column'  — after SELECT / WHERE / SET / AND / OR / HAVING / ON / BY etc.
+ * 'keyword' — at statement start or after semicolon
+ * 'any'     — ambiguous; tables + columns mixed, no keywords
+ */
+function detectContext(textarea) {
+    const val = textarea.value;
+    const caret = textarea.selectionStart;
+    // Strip the partial identifier being typed so we see only what came before it
+    let before = val.slice(0, caret).replace(/[A-Za-z0-9_]*$/, '');
+    // Remove string literals and comments to avoid false keyword matches inside them
+    before = before
+        .replace(/'(?:[^'\\]|\\.)*'/g, ' ')
+        .replace(/"(?:[^"\\]|\\.)*"/g, ' ')
+        .replace(/--[^\n]*/g, ' ')
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/\s+/g, ' ')
+        .trimEnd();
+    const u = before.toUpperCase();
+
+    // After table.col prefix → always column
+    if (/[A-Za-z0-9_]+\.$/.test(before)) return 'column';
+    // Table-name position: right after FROM / any JOIN variant / UPDATE / INTO
+    if (/\b(?:FROM|(?:INNER|LEFT|RIGHT|FULL|CROSS)\s+JOIN|JOIN|UPDATE|INTO)\s*$/.test(u)) return 'table';
+    // Multiple-table FROM: FROM t1, |
+    if (/\bFROM\b.+,\s*$/.test(u)) return 'table';
+    // Column-name position
+    if (/\b(?:SELECT|WHERE|SET|HAVING|ON|AND|OR|NOT|BY|BETWEEN|WHEN|THEN|ELSE|RETURNING)\s*$/.test(u)) return 'column';
+    // After comma or open paren (select list, IN list, function args…)
+    if (/[,(]\s*$/.test(u)) return 'column';
+    // Start of statement or immediately after semicolon → SQL keyword expected
+    if (/^$|;\s*$/.test(u)) return 'keyword';
+    // After * (SELECT * → next token is FROM)
+    if (/\*\s*$/.test(u)) return 'keyword';
+    return 'any';
 }
 
 function wireAutocomplete(textarea) {
@@ -203,10 +289,47 @@ function openAutocomplete(textarea, force) {
     const word = currentWord(textarea);
     if (!force && !word.text) { closeAutocomplete(); return; }
     const q = word.text.toLowerCase();
+    // Filter candidates by SQL context so only relevant completions appear:
+    //   table   → only table names
+    //   column  → only column names scoped to tables in the current query
+    //   keyword → only SQL keywords
+    //   any     → tables + columns (no keywords — they'd clutter mixed results)
+    const context = detectContext(textarea);
+    let candidates;
+    if (context === 'table') {
+        candidates = autocompleteState.items.filter(i => i.kind === 'table');
+    } else if (context === 'column') {
+        // Scope columns to tables mentioned in FROM/JOIN of the current query
+        const queryTables = extractTablesFromSql(textarea.value);
+        if (queryTables.length > 0 && autocompleteState.columnsByTable.size > 0) {
+            const seen = new Set();
+            const scoped = [];
+            for (const tbl of queryTables) {
+                const cols = autocompleteState.columnsByTable.get(tbl.toUpperCase());
+                if (!cols) continue;
+                for (const col of cols) {
+                    const key = col.toLowerCase();
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        scoped.push({ name: col, kind: 'column', hint: tbl });
+                    }
+                }
+            }
+            candidates = scoped.length > 0 ? scoped
+                // Fallback to all columns when scoped set is empty (table not in dataModel)
+                : autocompleteState.items.filter(i => i.kind === 'column');
+        } else {
+            candidates = autocompleteState.items.filter(i => i.kind === 'column');
+        }
+    } else if (context === 'keyword') {
+        candidates = autocompleteState.items.filter(i => i.kind === 'keyword');
+    } else {
+        candidates = autocompleteState.items.filter(i => i.kind !== 'keyword'); // 'any'
+    }
     // Match: prefix first, then substring
     const prefixMatches = [];
     const subMatches = [];
-    for (const item of autocompleteState.items) {
+    for (const item of candidates) {
         const nlow = item.name.toLowerCase();
         if (!q) { prefixMatches.push(item); continue; }
         if (nlow.startsWith(q)) prefixMatches.push(item);
@@ -228,7 +351,7 @@ function openAutocomplete(textarea, force) {
 function renderAutocompletePopup(popup, textarea) {
     popup.innerHTML = autocompleteState.matches.map((item, i) => `
         <div class="sql-ac-item ${i === autocompleteState.index ? 'active' : ''}" data-idx="${i}" role="option">
-            <span class="sql-ac-kind sql-ac-kind-${item.kind}">${item.kind === 'table' ? 'T' : 'c'}</span>
+            <span class="sql-ac-kind sql-ac-kind-${item.kind}">${item.kind === 'table' ? 'T' : item.kind === 'keyword' ? 'K' : 'c'}</span>
             <span class="sql-ac-name">${escapeHtml(item.name)}</span>
             ${item.hint ? `<span class="sql-ac-hint">${escapeHtml(item.hint)}</span>` : ''}
         </div>
@@ -453,6 +576,12 @@ export const sqlRunnerView = {
                     </div>
                 </div>
 
+                <div class="sql-run-label-wrap">
+                    <input type="text" id="sql-run-label" class="sql-run-label-input"
+                           placeholder="Label this query (optional — shown in history)…"
+                           autocomplete="off" spellcheck="false" maxlength="120">
+                </div>
+
                 <div class="sql-editor-wrap">
                     <textarea id="sql-input" class="sql-textarea"
                               placeholder="SELECT * FROM APPLICATION_DETAILS LIMIT 100&#10;or use :params like&#10;SELECT * FROM APPLICATION WHERE id = :appId"
@@ -549,10 +678,15 @@ export const sqlRunnerView = {
         let draftTimer = null;
         const saveDraftDebounced = () => {
             clearTimeout(draftTimer);
-            draftTimer = setTimeout(() => saveDraft(textarea.value, document.getElementById('sql-env').value), 200);
+            draftTimer = setTimeout(() => {
+                const lbl = document.getElementById('sql-run-label');
+                saveDraft(textarea.value, document.getElementById('sql-env').value, lbl?.value || '');
+            }, 200);
         };
         textarea.addEventListener('input', saveDraftDebounced);
         document.getElementById('sql-env').addEventListener('change', saveDraftDebounced);
+        const sqlRunLabel = document.getElementById('sql-run-label');
+        if (sqlRunLabel) sqlRunLabel.addEventListener('input', saveDraftDebounced);
 
         // Format SQL button
         const fmtBtn = document.getElementById('btn-format-sql');
@@ -761,6 +895,7 @@ function renderHistoryMenu(menu) {
         const badge = h.ok
             ? `<span class="sql-history-badge ok">${h.rowCount ?? 0} rows</span>`
             : `<span class="sql-history-badge fail">failed</span>`;
+        const nameTag = h.name ? `<div class="sql-history-name">${escapeHtml(h.name)}</div>` : '';
         return `
             <button class="sql-history-item" data-idx="${i}" type="button" role="menuitem">
                 <div class="sql-history-item-top">
@@ -768,6 +903,7 @@ function renderHistoryMenu(menu) {
                     ${badge}
                     <span class="sql-history-ts" title="${new Date(h.ts).toISOString()}">${relativeTime(h.ts)}</span>
                 </div>
+                ${nameTag}
                 <div class="sql-history-sql">${escapeHtml(firstLine)}${(h.sql || '').length > 90 ? '…' : ''}</div>
             </button>
         `;
@@ -857,7 +993,8 @@ async function runSql() {
     resultsEl.innerHTML = '';
 
     const started = Date.now();
-    let historyEntry = { sql, env, ok: false, elapsedMs: 0, rowCount: 0 };
+    const runLabel = (document.getElementById('sql-run-label')?.value || '').trim();
+    let historyEntry = { sql, env, ok: false, elapsedMs: 0, rowCount: 0, name: runLabel || undefined };
     try {
         const result = await executeSql({ env, sql });
         const elapsedMs = Date.now() - started;
@@ -1022,7 +1159,8 @@ async function runMultiStatements(stmts, env) {
     } else {
         showStatus(`Statement ${failedIdx + 1} failed after ${totalElapsed}: ${failMsg}`, 'error');
     }
-    pushHistory({ sql: stmts.join(';\n'), env, ok, elapsedMs: Date.now() - started, rowCount: totalRows });
+    const multiLabel = (document.getElementById('sql-run-label')?.value || '').trim();
+    pushHistory({ sql: stmts.join(';\n'), env, ok, elapsedMs: Date.now() - started, rowCount: totalRows, name: multiLabel || undefined });
     runBtn.disabled = false;
     runBtn.innerHTML = originalHtml;
 }
@@ -1179,7 +1317,7 @@ function wireMultiStmtRows(bodyEl, rows, tableName) {
                 if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
                 const col = td.dataset.col;
                 if (!col) return;
-                openCellInspector(col, row[col]);
+                openCellInspector(col, row[col], row, tableName);
             });
         });
     });
@@ -1841,7 +1979,10 @@ function openRowContextMenu(x, y, row, tableNameOverride) {
         for (let i = 0; i < jumpEntries.length; i++) {
             const { fk, value } = jumpEntries[i];
             const label = `${fk.column} → ${fk.targetTable} (${String(value).slice(0, 32)})`;
-            parts.push(`<button data-action="fk-jump" data-jump-idx="${i}" type="button">${escapeHtml(label)}</button>`);
+            const virtualTag = fk.virtual
+                ? '<span class="sql-row-menu-virtual-tag">virtual</span>'
+                : '';
+            parts.push(`<button data-action="fk-jump" data-jump-idx="${i}" type="button"${fk.virtual ? ' class="sql-row-menu-virtual"' : ''}>${escapeHtml(label)}${virtualTag}</button>`);
         }
     }
 
@@ -2046,6 +2187,7 @@ function quoteIdent(name) {
 function wireCellInspector() {
     const container = document.getElementById('sql-table-and-pagination');
     if (!container) return;
+    const tableName = inferTableName(sqlState.sql);
     container.querySelectorAll('td.sql-cell').forEach(td => {
         td.addEventListener('click', (e) => {
             if (e.button !== 0) return;
@@ -2056,12 +2198,12 @@ function wireCellInspector() {
             const col = td.dataset.col;
             const row = (sqlState.currentPageRows || [])[idx];
             if (!row || !col) return;
-            openCellInspector(col, row[col]);
+            openCellInspector(col, row[col], row, tableName);
         });
     });
 }
 
-function openCellInspector(colName, value) {
+function openCellInspector(colName, value, row, tableName) {
     closeCellInspector();
     const overlay = document.createElement('div');
     overlay.id = 'sql-cell-inspector';
@@ -2098,6 +2240,24 @@ function openCellInspector(colName, value) {
         : typeof value;
     const byteLen = isNull ? 0 : new TextEncoder().encode(String(display)).length;
 
+    // Update is only offered when (a) we have the full row, (b) the target
+    // table is resolvable, and (c) the row carries every PK column so we can
+    // safely emit a WHERE clause. Anything less and the button disables with
+    // a tooltip explaining exactly what's missing — safer than the user
+    // discovering it via a backend error.
+    const pkColumns = pkColumnsFor(tableName);
+    const pkValues = pkColumns ? pickPkValues(row, pkColumns) : null;
+    const canUpdate = !!(row && tableName && pkValues);
+    const updateDisabledReason = !row
+        ? 'Row context unavailable — click a cell in a normal result grid to enable update.'
+        : !tableName
+            ? 'Cannot determine target table from the current query.'
+            : !pkColumns
+                ? `Primary key not found in the loaded dataModel for ${tableName}.`
+                : !pkValues
+                    ? `Row is missing PK column(s): ${pkColumns.filter(c => !(c in (row || {}))).join(', ')} — include them in the SELECT to enable update.`
+                    : '';
+
     overlay.innerHTML = `
         <div class="modal-panel sql-cell-panel">
             <h3>${escapeHtml(colName)}</h3>
@@ -2105,10 +2265,26 @@ function openCellInspector(colName, value) {
                 <span class="sql-cell-tag">${escapeHtml(typeLabel)}</span>
                 <span class="sql-cell-tag">${byteLen.toLocaleString()} bytes</span>
                 ${isJson ? '<span class="sql-cell-tag sql-cell-tag-primary">pretty-printed</span>' : ''}
+                ${canUpdate ? `<span class="sql-cell-tag sql-cell-tag-muted">update target: <code>${escapeHtml(tableName)}</code> WHERE ${escapeHtml(pkColumns.map(c => `${c}=${row[c]}`).join(' AND '))}</span>` : ''}
             </div>
-            <pre class="sql-cell-value">${escapeHtml(display)}</pre>
+            <textarea class="sql-cell-value sql-cell-edit"
+                      spellcheck="false"
+                      aria-label="Cell value (editable)">${escapeHtml(display)}</textarea>
+            <p class="sql-cell-help" id="sql-cell-help">
+                Edit the value above, then hit <strong>Update cell</strong> to fire
+                <code>UPDATE ${escapeHtml(tableName || '?')} SET ${escapeHtml(colName)} = &lt;new value&gt; WHERE &lt;pk&gt;</code>
+                for this row only. On failure the grid stays exactly as it was — the DB is the source of truth,
+                nothing is optimistically applied without confirmation from it.
+            </p>
+            <div id="sql-cell-status" class="sql-cell-status" hidden></div>
             <div class="modal-actions">
                 <button class="btn" data-action="copy" type="button">Copy value</button>
+                <button class="btn ${canUpdate ? '' : 'secondary'}"
+                        data-action="update" type="button"
+                        ${canUpdate ? '' : 'disabled'}
+                        ${updateDisabledReason ? `title="${escapeHtml(updateDisabledReason)}"` : ''}>
+                    Update cell
+                </button>
                 <button class="btn secondary" data-action="close" type="button">Close</button>
             </div>
         </div>
@@ -2117,15 +2293,151 @@ function openCellInspector(colName, value) {
 
     const closeAction = overlay.querySelector('button[data-action="close"]');
     const copyBtn = overlay.querySelector('button[data-action="copy"]');
+    const updateBtn = overlay.querySelector('button[data-action="update"]');
+    const editEl = overlay.querySelector('.sql-cell-edit');
+    const statusEl = overlay.querySelector('#sql-cell-status');
+    const helpEl = overlay.querySelector('#sql-cell-help');
+
     closeAction.addEventListener('click', closeCellInspector);
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeCellInspector(); });
     copyBtn.addEventListener('click', () => {
-        copyToClipboard(isNull ? '' : display, 'Cell value');
+        copyToClipboard(editEl.value, 'Cell value');
     });
+    if (canUpdate) {
+        updateBtn.addEventListener('click', async () => {
+            await handleUpdateCell({
+                colName, isNull, isJson, originalValue: value,
+                row, tableName, pkColumns, pkValues,
+                editEl, updateBtn, statusEl, helpEl,
+            });
+        });
+    }
     // Escape closes
     document.addEventListener('keydown', function esc(e) {
         if (e.key === 'Escape') { closeCellInspector(); document.removeEventListener('keydown', esc); }
     });
+
+    // Focus the textarea so the user can type immediately.
+    setTimeout(() => editEl && editEl.focus(), 0);
+}
+
+/**
+ * Fire an UPDATE for the edited cell of the currently-selected row.
+ *
+ * <p>Only touches the DB — no optimistic mutation. On success, the row's
+ * column value in {@code sqlState.allRows} is patched in place and the grid
+ * re-renders so the user sees the new value land. On failure, the grid is
+ * unchanged (there was nothing to revert since we didn't optimistically
+ * apply) and the error is surfaced inline in the modal + as a toast.
+ */
+async function handleUpdateCell(ctx) {
+    const { colName, isNull, isJson, originalValue,
+            row, tableName, pkColumns, pkValues,
+            editEl, updateBtn, statusEl, helpEl } = ctx;
+    const raw = editEl.value;
+    // Re-parse the edited value to a JS type matching the display's format:
+    //   • NULL literal in the box → null
+    //   • Was JSON pretty-printed → try to parse back into an object
+    //   • Otherwise → send as-is (string)
+    let coerced;
+    if (isNull && raw.trim() === 'NULL') {
+        coerced = null;
+    } else if (isJson) {
+        try { coerced = JSON.parse(raw); }
+        catch { coerced = raw; }   // user broke the JSON — send raw text; DB will complain if needed
+    } else {
+        coerced = raw;
+    }
+
+    // No-op guard: if the value hasn't actually changed, skip the round-trip.
+    if (coerced === originalValue) {
+        statusEl.hidden = false;
+        statusEl.className = 'sql-cell-status sql-cell-status-loading';
+        statusEl.textContent = 'Nothing changed — no update sent.';
+        return;
+    }
+
+    const env = sqlState.env || document.getElementById('sql-env')?.value || 'sandbox';
+
+    statusEl.hidden = false;
+    statusEl.className = 'sql-cell-status sql-cell-status-loading';
+    statusEl.textContent = 'Updating…';
+    if (helpEl) helpEl.hidden = true;
+    updateBtn.disabled = true;
+    const origLabel = updateBtn.textContent;
+    updateBtn.textContent = 'Updating…';
+
+    let res;
+    try {
+        res = await updateCell({
+            env, table: tableName, column: colName, newValue: coerced, pk: pkValues,
+        });
+    } catch (err) {
+        res = { success: false, error: err && err.message ? err.message : String(err) };
+    }
+
+    updateBtn.disabled = false;
+    updateBtn.textContent = origLabel;
+
+    if (res && res.success) {
+        // Mutate the row object in place — JS object refs mean this propagates
+        // to sqlState.allRows / currentPageRows automatically. Then re-render.
+        row[colName] = coerced;
+        try { renderTablePart(); } catch { /* fall back to next natural re-render */ }
+        statusEl.className = 'sql-cell-status sql-cell-status-ok';
+        statusEl.innerHTML = `Cell updated in <code>${escapeHtml(tableName)}</code>.`;
+        (window.showToast || alert)(`Cell updated in ${tableName}.`, 'success', 4000);
+        setTimeout(closeCellInspector, 700);
+        return;
+    }
+
+    // Failure — surface the reason inline; grid intentionally unchanged.
+    const errorText = extractCellUpdateErrorText(res);
+    statusEl.className = 'sql-cell-status sql-cell-status-err';
+    statusEl.innerHTML = `
+        <div class="sql-cell-status-title">Update failed — grid left unchanged.</div>
+        <pre class="sql-cell-status-detail">${escapeHtml(errorText)}</pre>
+        ${res && res.sql ? `<details class="sql-cell-status-sql"><summary>SQL that was attempted</summary><pre>${escapeHtml(res.sql)}</pre></details>` : ''}
+    `;
+    (window.showToast || alert)(`Update failed: ${errorText.split('\n')[0]}`, 'error', 6000);
+}
+
+function extractCellUpdateErrorText(res) {
+    if (!res) return 'Unknown error.';
+    const parts = [];
+    if (res.error) parts.push(String(res.error));
+    if (res.body) parts.push(String(res.body).slice(0, 4000));
+    if (parts.length === 0) parts.push(`HTTP ${res.status || '?'}`);
+    return parts.join('\n\n');
+}
+
+/**
+ * Look up the PK column list for the given table from the cached dataModel.
+ * Returns null when the table isn't in the dataModel or has no PK — the
+ * caller uses that to disable the Update button with a clear tooltip.
+ */
+function pkColumnsFor(tableName) {
+    if (!tableName || !dataModelState.tablesByUpperName) return null;
+    const t = dataModelState.tablesByUpperName.get(String(tableName).toUpperCase());
+    if (!t || !t.primaryKey || !Array.isArray(t.primaryKey.columns)) return null;
+    const cols = t.primaryKey.columns.filter(c => c && typeof c === 'string');
+    return cols.length ? cols : null;
+}
+
+/**
+ * Extract PK column→value from the row. Returns an ordered object suitable
+ * for the update-cell backend, or null if any PK column is missing from the
+ * row (e.g., query didn't SELECT it) — safer than sending a partial WHERE
+ * that could update multiple rows.
+ */
+function pickPkValues(row, pkColumns) {
+    if (!row || !Array.isArray(pkColumns) || pkColumns.length === 0) return null;
+    const out = {};
+    for (const c of pkColumns) {
+        if (!(c in row)) return null;
+        out[c] = row[c];
+    }
+    return out;
 }
 
 function closeCellInspector() {
@@ -2389,6 +2701,24 @@ const dataModelState = {
     loading: null,             // Promise<void> to dedupe concurrent loads
 };
 
+/**
+ * Invalidate the dataModel cache. Called when the profile is saved so that
+ * changes like edits to {@code virtualForeignKeys} propagate — otherwise the
+ * profileId-based short-circuit in {@link ensureDataModelLoaded} keeps
+ * serving pre-edit relations and things like "Jump to referenced row" miss
+ * the newly-added virtual FKs.
+ */
+function invalidateDataModelState() {
+    dataModelState.profileId = null;
+    dataModelState.tablesByUpperName = null;
+    dataModelState.reverseFks = null;
+    dataModelState.loading = null;
+}
+
+// Any profile save (or activation) should force a reload of the FK graph next
+// time SQL Runner needs it. Registered once at module load — idempotent.
+window.addEventListener('profile-changed', invalidateDataModelState);
+
 async function ensureDataModelLoaded(profileId) {
     if (!profileId) return;
     if (dataModelState.profileId === profileId && dataModelState.tablesByUpperName) return;
@@ -2467,6 +2797,7 @@ function outgoingFks(tableName) {
             column: mapping.sourceColumn,
             targetTable: r.targetTable,
             targetColumn: mapping.targetColumn || 'id',
+            virtual: !!r.virtual,   // distinguishes real FK from profile-configured virtual FK
         });
     }
     return out;

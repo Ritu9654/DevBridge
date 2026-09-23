@@ -87,7 +87,7 @@ public class AppSqlFetchService {
             throw new IllegalArgumentException("Source appId is required.");
         }
 
-        FkGraph graph = FkGraph.from(dataModel);
+        FkGraph graph = FkGraph.from(dataModel, profile.virtualForeignKeys());
         DataModel.Table root = graph.table(rootTable).orElseThrow(() ->
                 new IllegalStateException("Root table '" + rootTable + "' not found in dataModel."));
         Set<String> refSet = normaliseReferenceTables(referenceTables);

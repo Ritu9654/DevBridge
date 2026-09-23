@@ -16,6 +16,7 @@
     --color-danger: #dc2626;
     --color-danger-soft: #fee2e2;
     --color-warning: #d97706;
+    --color-warning-soft: #fef3c7;   /* amber 100 — pairs with --color-warning for badges */
 
     /* Slate scale — main greyscale */
     --slate-50:  #f8fafc;
@@ -93,6 +94,7 @@
 
     --color-success-soft: rgba(5, 150, 105, 0.22);
     --color-danger-soft: rgba(220, 38, 38, 0.22);
+    --color-warning-soft: rgba(217, 119, 6, 0.22);
 
     --bg-app: #0f172a;
     --bg-surface: #1e293b;
@@ -585,6 +587,7 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
     color: var(--slate-600);
 }
 .badge.badge-danger { background: var(--color-danger-soft); color: var(--color-danger); }
+.badge.badge-warning { background: var(--color-warning-soft); color: var(--color-warning); }
 
 /* ---------- 10. Profile grid + cards ---------- */
 .profile-grid {
@@ -1138,6 +1141,50 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
     font-weight: 500;
 }
 
+.vfk-suggestions-panel {
+    margin-top: var(--s-2);
+    padding: var(--s-3);
+    background: var(--surface-2, #f6f7f9);
+    border: 1px solid var(--border, #e5e7eb);
+    border-radius: 6px;
+}
+.vfk-suggestions-header {
+    font-size: 13px;
+    margin-bottom: var(--s-2);
+}
+.vfk-suggestions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 260px;
+    overflow-y: auto;
+    margin-bottom: var(--s-2);
+}
+.vfk-suggestion-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    font-size: 13px;
+}
+.vfk-suggestion-col {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+.vfk-suggestion-arrow { color: var(--text-muted); }
+.vfk-suggestion-target {
+    padding: 4px 8px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    border: 1px solid var(--border, #e5e7eb);
+    border-radius: 4px;
+    min-width: 140px;
+}
+.vfk-suggestions-actions {
+    display: flex;
+    gap: var(--s-2);
+}
+.vfk-suggestions-error { color: var(--color-danger); }
+
 /* ---------- 15. Tables ---------- */
 .sql-runner { max-width: 100%; }
 .sql-controls {
@@ -1158,6 +1205,29 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
     font-size: 11px;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
+
+/* Optional label input shown above the SQL editor */
+.sql-run-label-wrap {
+    margin-bottom: var(--s-2);
+}
+.sql-run-label-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px var(--s-3);
+    font-size: 12px;
+    font-family: inherit;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text);
+    transition: border-color var(--dur-fast), box-shadow var(--dur-fast);
+}
+.sql-run-label-input:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--color-primary-ring);
+}
+.sql-run-label-input::placeholder { color: var(--text-subtle); }
 
 .sql-textarea {
     width: 100%;
@@ -1511,6 +1581,15 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
     color: var(--color-danger, #dc2626);
 }
 .sql-history-ts { margin-left: auto; }
+.sql-history-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-primary);
+    margin-bottom: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 .sql-history-sql {
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
     font-size: 12px;
@@ -1627,6 +1706,11 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
     background: var(--color-primary-soft);
     color: var(--color-primary);
 }
+.sql-cell-tag-muted {
+    background: var(--slate-100, rgba(148, 163, 184, 0.15));
+    color: var(--text-muted);
+}
+.sql-cell-tag-muted code { font-size: 11px; }
 .sql-cell-value {
     flex: 1;
     margin: 0 var(--s-4);
@@ -1642,6 +1726,72 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
     word-wrap: break-word;
     color: var(--text);
     max-height: 60vh;
+}
+/* Editable variant of .sql-cell-value — used by the cell inspector's Insert
+ * feature. Same monospace/dark-panel feel; adds resize + focus ring. */
+textarea.sql-cell-edit {
+    width: auto;
+    min-height: 120px;
+    resize: vertical;
+}
+textarea.sql-cell-edit:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--color-primary-ring);
+}
+.sql-cell-help {
+    margin: var(--s-2) var(--s-4) 0;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+.sql-cell-status {
+    margin: var(--s-3) var(--s-4) 0;
+    padding: var(--s-3);
+    border-radius: var(--r);
+    font-size: 13px;
+    border: 1px solid var(--border);
+}
+.sql-cell-status.sql-cell-status-loading {
+    background: var(--slate-100, rgba(148, 163, 184, 0.15));
+    color: var(--text-muted);
+}
+.sql-cell-status.sql-cell-status-ok {
+    background: var(--color-success-soft);
+    color: var(--color-success);
+    border-color: transparent;
+}
+.sql-cell-status.sql-cell-status-err {
+    background: var(--color-danger-soft);
+    color: var(--color-danger);
+    border-color: transparent;
+}
+.sql-cell-status-title { font-weight: 600; margin-bottom: 6px; }
+.sql-cell-status-detail {
+    margin: 0;
+    padding: var(--s-2);
+    background: rgba(0, 0, 0, 0.06);
+    border-radius: 4px;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    color: var(--text);
+    max-height: 200px;
+    overflow: auto;
+}
+.sql-cell-status-sql { margin-top: 6px; font-size: 12px; }
+.sql-cell-status-sql pre {
+    margin: 4px 0 0;
+    padding: var(--s-2);
+    background: var(--bg-subtle);
+    border-radius: 4px;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    font-size: 11px;
+    white-space: pre-wrap;
+    color: var(--text);
+    max-height: 200px;
+    overflow: auto;
 }
 .sql-cell {
     cursor: pointer;
@@ -1778,6 +1928,7 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
 }
 .sql-ac-kind-table { background: var(--color-primary); color: #fff; }
 .sql-ac-kind-column { background: var(--slate-200, #e2e8f0); color: var(--slate-700, #334155); }
+.sql-ac-kind-keyword { background: var(--color-success-soft, #d1fae5); color: var(--color-success, #059669); }
 .sql-ac-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sql-ac-hint {
     font-size: 10px;
@@ -1802,6 +1953,22 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
 .sql-row-context-menu button.sql-row-menu-subtle {
     color: var(--text-muted);
     font-size: 12px;
+}
+/* Virtual-FK jump entry — warning-tinted so it's obviously not a real FK */
+.sql-row-context-menu button.sql-row-menu-virtual {
+    color: var(--color-warning);
+}
+.sql-row-menu-virtual-tag {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: var(--color-warning-soft);
+    color: var(--color-warning);
+    border-radius: var(--r-full);
 }
 
 /* Column stats modal */
@@ -2777,6 +2944,24 @@ input::placeholder, textarea::placeholder { color: var(--text-subtle); }
     font-family: inherit;
 }
 .dbe-target-link:hover { text-decoration: underline; }
+
+/* Virtual FK target link (Relations table) — warning-tinted so users see at
+ * a glance which relations are user-configured vs schema-declared. */
+.dbe-target-link.dbe-fk-link-virtual { color: var(--color-warning); }
+/* Virtual-relation row in the Relations table — soft warning tint on the
+ * whole row so it stands out from real FKs in a busy list. Kept subtle so
+ * the row's own content stays readable. */
+.dbe-rel-row-virtual { background: var(--color-warning-soft); }
+.dbe-rel-row-virtual:hover { background: var(--color-warning-soft); filter: brightness(0.98); }
+/* FK column-name cell — subtle dotted underline hints there's a tooltip. */
+.dbe-col-fk {
+    text-decoration: underline dotted var(--text-muted);
+    text-underline-offset: 3px;
+    cursor: help;
+}
+.dbe-col-fk.dbe-col-fk-virtual {
+    text-decoration-color: var(--color-warning);
+}
 
 @media (max-width: 900px) {
     .dbe-layout { grid-template-columns: 1fr; }

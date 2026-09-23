@@ -1,5 +1,8 @@
 package com.devbridge.api;
 
+import com.devbridge.apps.VirtualFkSuggester;
+import com.devbridge.datamodel.DataModel;
+import com.devbridge.datamodel.DataModelService;
 import com.devbridge.fawb.TestConnectionResult;
 import com.devbridge.fawb.TestConnectionService;
 import com.devbridge.profile.ProfileService;
@@ -16,6 +19,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/profiles")
@@ -23,10 +27,17 @@ public class ProfileController {
 
     private final ProfileService service;
     private final TestConnectionService testConnectionService;
+    private final DataModelService dataModelService;
+    private final VirtualFkSuggester virtualFkSuggester;
 
-    public ProfileController(ProfileService service, TestConnectionService testConnectionService) {
+    public ProfileController(ProfileService service,
+                             TestConnectionService testConnectionService,
+                             DataModelService dataModelService,
+                             VirtualFkSuggester virtualFkSuggester) {
         this.service = service;
         this.testConnectionService = testConnectionService;
+        this.dataModelService = dataModelService;
+        this.virtualFkSuggester = virtualFkSuggester;
     }
 
     @GetMapping
@@ -96,5 +107,21 @@ public class ProfileController {
     @GetMapping("/legacy-export")
     public List<ProjectProfile> legacyExport() {
         return service.list();
+    }
+
+    /**
+     * Name-heuristic suggestions for the {@code virtualForeignKeys} profile
+     * field. Scans the profile's cached dataModel for integer columns whose
+     * name looks like it stores a reference id (Status, Type, Code, ...) and
+     * that are NOT already declared FKs. Defaults each suggestion's target
+     * to {@code DomainValue}; the client can override before saving. Returns
+     * 404 when the profile has no dataModel uploaded yet — the client should
+     * prompt the user to upload one first.
+     */
+    @GetMapping("/{id}/virtual-fk-suggestions")
+    public ResponseEntity<List<VirtualFkSuggester.Suggestion>> virtualFkSuggestions(@PathVariable String id) {
+        Optional<DataModel> model = dataModelService.get(id);
+        if (model.isEmpty()) return ResponseEntity.notFound().build();
+        return ResponseEntity.ok(virtualFkSuggester.suggest(model.get()));
     }
 }

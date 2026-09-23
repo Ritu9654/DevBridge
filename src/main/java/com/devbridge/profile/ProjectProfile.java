@@ -78,6 +78,14 @@ import java.util.Map;
  *     When set, the parent table's insert changes path and the child table
  *     is inserted as nested data alongside its parent. When null/omitted,
  *     routing is unchanged.
+ * @param virtualForeignKeys advanced: list of columns that logically hold
+ *     ids from a reference table but are NOT declared as FKs in the
+ *     dataModel. Each entry is projected into the FK graph as a synthetic
+ *     edge at plan time, so the remap engine treats them identically to
+ *     real FKs. Fixes "domain value not found" (and similar) validation
+ *     errors on app submit in the target env, which arise when the raw
+ *     source id gets inserted without translation. See
+ *     {@link VirtualForeignKey}.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -103,6 +111,7 @@ public record ProjectProfile(
         Map<String, ReferenceTableConfig> referenceTableConfigs,
         List<String> csvOnlyTables,
         NestedInsertConfig nestedInsertConfig,
+        List<VirtualForeignKey> virtualForeignKeys,
         Instant createdAt,
         Instant lastUsedAt
 ) {
@@ -115,7 +124,7 @@ public record ProjectProfile(
                 rootTableName, rootPkFilterColumn,
                 dataModelJsonPath, facadeKeyOverrides, referenceTables,
                 referenceTableConfigs, csvOnlyTables,
-                nestedInsertConfig, created, lastUsed
+                nestedInsertConfig, virtualForeignKeys, created, lastUsed
         );
     }
 }

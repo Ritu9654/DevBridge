@@ -1,9 +1,11 @@
 package com.devbridge.api;
 
+import com.devbridge.apps.VirtualFkOverlay;
 import com.devbridge.datamodel.DataModel;
 import com.devbridge.datamodel.DataModelService;
 import com.devbridge.datamodel.DataModelSummary;
 import com.devbridge.profile.ProfileService;
+import com.devbridge.profile.ProjectProfile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
@@ -108,11 +110,18 @@ public class DataModelController {
     /**
      * Full detail for a single table, looked up case-insensitively by either
      * {@code name} (physical) or {@code entityName} (FAWB).
+     *
+     * <p>The returned table has the profile's {@code virtualForeignKeys}
+     * overlaid as synthetic {@code ManyToOne} relations (marked
+     * {@code virtual=true}) so every downstream consumer — SQL Runner's
+     * jump-to-referenced-row, DB Explorer's FK cell — treats them the same
+     * as real FKs. See {@link VirtualFkOverlay}.
      */
     @GetMapping("/tables/{tableName}")
     public ResponseEntity<?> tableDetail(@PathVariable String profileId,
                                          @PathVariable String tableName) {
-        if (profileService.findById(profileId).isEmpty()) {
+        Optional<ProjectProfile> profile = profileService.findById(profileId);
+        if (profile.isEmpty()) {
             return ResponseEntity.notFound().build();
         }
         Optional<DataModel> model = service.get(profileId);
@@ -120,8 +129,9 @@ public class DataModelController {
             return ResponseEntity.badRequest().body(Map.of(
                     "error", "No dataModel loaded for this profile."));
         }
+        DataModel overlaid = VirtualFkOverlay.apply(model.get(), profile.get().virtualForeignKeys());
         String needle = tableName.toLowerCase(Locale.ROOT);
-        for (DataModel.Table t : model.get().tables()) {
+        for (DataModel.Table t : overlaid.tables()) {
             String n = t.name() == null ? "" : t.name().toLowerCase(Locale.ROOT);
             String e = t.entityName() == null ? "" : t.entityName().toLowerCase(Locale.ROOT);
             if (needle.equals(n) || needle.equals(e)) {
@@ -137,7 +147,8 @@ public class DataModelController {
      */
     @GetMapping("/graph")
     public ResponseEntity<?> graph(@PathVariable String profileId) {
-        if (profileService.findById(profileId).isEmpty()) {
+        Optional<ProjectProfile> profile = profileService.findById(profileId);
+        if (profile.isEmpty()) {
             return ResponseEntity.notFound().build();
         }
         Optional<DataModel> model = service.get(profileId);
@@ -146,9 +157,13 @@ public class DataModelController {
                     "error", "No dataModel loaded for this profile. Upload one first."));
         }
 
+        // Overlay virtual FKs so the ERD reflects them as (virtual) edges,
+        // consistent with the tableDetail endpoint.
+        DataModel overlaid = VirtualFkOverlay.apply(model.get(), profile.get().virtualForeignKeys());
+
         List<GraphNode> nodes = new ArrayList<>();
         List<GraphEdge> edges = new ArrayList<>();
-        for (DataModel.Table t : model.get().tables()) {
+        for (DataModel.Table t : overlaid.tables()) {
             int cols = t.columns() == null ? 0 : t.columns().size();
             int rels = t.relations() == null ? 0 : t.relations().size();
             nodes.add(new GraphNode(t.entityName(), t.name(), t.type(), cols, rels));
@@ -156,7 +171,7 @@ public class DataModelController {
                 for (DataModel.Relation r : t.relations()) {
                     // targetTable in dataModel is the physical name; resolve to entityName
                     // for consistent node IDs on the frontend.
-                    String targetEntity = resolveEntityName(model.get(), r.targetTable());
+                    String targetEntity = resolveEntityName(overlaid, r.targetTable());
                     edges.add(new GraphEdge(
                             t.entityName(),
                             targetEntity != null ? targetEntity : r.targetTable(),

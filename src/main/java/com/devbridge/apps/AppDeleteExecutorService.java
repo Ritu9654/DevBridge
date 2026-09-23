@@ -14,11 +14,9 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -33,7 +31,7 @@ import java.util.UUID;
  *   NOT attempted — the user reruns after fixing the FK blocker.</li>
  *   <li>Journal every DELETE outcome (success and failure), persist to disk
  *   after each table so an interruption still leaves a truthful record.</li>
- *   <li>Reference tables never touched.</li>
+ *   <li>All FK-dependent tables are included (no referenceTables filter) so FK constraints are always satisfied.</li>
  *   <li>No rollback — delete is destructive. Rerun is safe: already-deleted
  *   rows just no-op (envelope will report a benign "no rows affected").</li>
  * </ol>
@@ -71,7 +69,6 @@ public class AppDeleteExecutorService {
         journalStore.write(journal);
 
         FkGraph graph = fetch.graph();
-        Set<String> refSet = normaliseReferences(profile.referenceTables());
         List<String> subset = new ArrayList<>(fetch.rowsByTable().keySet());
         FkGraph.TopoResult topo = graph.topoSort(subset);
         List<String> deleteOrder = new ArrayList<>(topo.ordered());
@@ -80,8 +77,6 @@ public class AppDeleteExecutorService {
         StepCounter counter = new StepCounter();
         try {
             for (String tableName : deleteOrder) {
-                if (refSet.contains(FkGraph.norm(tableName))) continue;
-
                 List<Map<String, Object>> rows = fetch.rowsByTable().get(tableName);
                 if (rows == null || rows.isEmpty()) continue;
 
@@ -237,13 +232,6 @@ public class AppDeleteExecutorService {
             if (e.getKey() != null && e.getKey().toLowerCase(Locale.ROOT).equals(lower)) return e.getValue();
         }
         return null;
-    }
-
-    private static Set<String> normaliseReferences(List<String> configured) {
-        Set<String> out = new HashSet<>();
-        if (configured == null) return out;
-        for (String s : configured) if (s != null && !s.isBlank()) out.add(FkGraph.norm(s.trim()));
-        return out;
     }
 
     private static String trunc(String s) {

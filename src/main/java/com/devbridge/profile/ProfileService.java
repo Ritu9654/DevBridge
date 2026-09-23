@@ -66,6 +66,7 @@ public class ProfileService {
                 input.referenceTableConfigs(),
                 input.csvOnlyTables(),
                 input.nestedInsertConfig(),
+                input.virtualForeignKeys(),
                 prev.createdAt(),
                 prev.lastUsedAt()
         );

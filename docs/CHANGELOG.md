@@ -20,6 +20,191 @@ Work in progress toward v0.1.0. See [PROJECT.md § 5](PROJECT.md#5-progress-trac
 
 ---
 
+## [0.1.0-SNAPSHOT] — Correcting yesterday: Update cell (not Insert row); DB Explorer polish — 2026-09-23
+
+### Correcting the previous entry
+Yesterday's "inline single-row INSERT" was the wrong operation. The intent was always to edit an *existing* row's value in place — an UPDATE, not an INSERT. Reverted the INSERT flow entirely and replaced it with **Update cell**.
+
+### Changed — cell inspector (SQL Runner)
+- Button renamed **Insert row → Update cell**.
+- Backend endpoint replaced: `POST /api/sql/insert-row` → `POST /api/sql/update-cell` (`{env, table, column, newValue, pk: {col: val, ...}}`). Composite PK safe — every PK column becomes an `AND` in the WHERE. Refuses when `pk` is empty so a WHERE-less UPDATE can never be emitted.
+- Client resolves PK columns from the cached dataModel (`primaryKey.columns`) and reads their values off the current row. If any PK column isn't in the row (e.g. the SELECT didn't include it), the button disables with a specific tooltip naming the missing columns.
+- No optimistic mutation — the DB is the source of truth. On success, the row's column value is patched in place (`row[col] = coerced`) and the grid re-renders. On failure, the grid stays unchanged and the error is surfaced inline (with the FAWB body + collapsible "SQL that was attempted") plus a toast.
+- No-op guard: if the coerced new value is `===` the original, nothing is sent — status shows "Nothing changed — no update sent."
+
+### Changed — DB Explorer, Columns table
+- Removed the inline `→ TargetTable` text from the FK cell. The Relations table below already lists every target; the redundant clickable link cluttered the row and the Columns table's job is column metadata.
+- FK cell now just renders a color-coded badge: `[FK]` (muted) for real, `[FK*]` (warning-tinted amber) for virtual. Column-name hover tooltip still surfaces the target for anyone who wants it inline.
+
+### Changed — DB Explorer, Relations table
+- Virtual-relation rows get a soft amber background (`--color-warning-soft`) — makes them stand out at a glance in a busy list, on top of the existing amber "virtual" badge and amber target link.
+
+### Removed
+- `SqlController#insertRow` + `buildInsertSql` — replaced by `updateCell` + `buildUpdateCellSql`.
+- `api.js` `insertRow` — replaced by `updateCell`.
+- `sql-runner.js` `handleInsertRow`, `prependRowIntoCurrentResult` — replaced by `handleUpdateCell`, `pkColumnsFor`, `pickPkValues`.
+- Orphaned `.dbe-fk-link` / `.dbe-fk-arrow` CSS (the inline FK-cell link is gone).
+
+### How to test
+1. Rebuild + reload.
+2. Run `SELECT * FROM DomainValue LIMIT 5` (sandbox — a table that has a PK).
+3. Click a `Code` cell → modal shows the current value + PK preview in the meta bar ("update target: `DomainValue` WHERE id=42").
+4. Edit → **Update cell** → toast success, grid cell shows the new value. Watch server log for `UPDATE \`DomainValue\` SET \`Code\` = 'X' WHERE \`id\` = 42`.
+5. Try a query without the PK (e.g. `SELECT Code, Name FROM DomainValue LIMIT 5`) → click a cell → **Update cell** button is disabled with a tooltip naming the missing PK column.
+6. DB Explorer → open any table with a virtual FK → the Relations table row for that virtual FK is tinted amber; the Columns table's FK cell shows only `[FK*]` (no target text).
+
+---
+
+## [0.1.0-SNAPSHOT] — SQL Runner: inline single-row INSERT from the cell inspector — 2026-09-23 (superseded — see entry above)
+
+### Added
+Cell inspector modal used to be view + copy only. It now offers a one-click **Insert row** flow: the value textarea is editable, and clicking Insert fires a single-row `INSERT INTO <table> (col1, col2, …) VALUES (…)` against the selected env — with the clicked column's value replaced by whatever the user typed. Everything else in the row is copied from the currently-selected result-set row.
+
+Typical use case: developer sees a well-formed row in the design env, tweaks one field (e.g. give the copy a different `Code`), inserts it into their sandbox — no hand-crafting an INSERT statement, no clipboard shuffling.
+
+### Added — client
+- **`insertRow({env, table, values})`** in `api.js` — same structured-error pattern as `executeSql`; returns `{success, sql, error, body, status}` without throwing so the caller can render inline diagnostics.
+- **Cell inspector rewrite** (`sql-runner.js`):
+  - Value pane is now a `<textarea>` (was `<pre>`), focused on open.
+  - **Insert row** button appears beside **Copy value**. Disabled with a tooltip when the target table can't be inferred (aggregate query, ambiguous JOIN, DDL result).
+  - Live status area under the buttons: `Inserting…` → success (green) or error (red, with the FAWB body verbatim and a collapsible "SQL that was attempted" panel).
+  - **Success:** toast + optimistic prepend of the freshly-inserted row into the current result set so the user sees it land without re-running the query. If the current query's column set doesn't cover all keys, the prepend is skipped (row is already in the DB — no correctness issue).
+  - **Failure:** modal stays open, error rendered inline, result set left untouched. Nothing to "revert" because nothing was optimistically added on failure.
+
+### Added — server
+- **`POST /api/sql/insert-row`** on `SqlController`, body `{env, table, values}`. Builds the INSERT via `SqlBuilder.ident` + `SqlBuilder.literal` (same escaping as every other statement the runtime emits — no duplication of quoting logic). Executes via `SqlService`, returns the emitted SQL for transparency plus the FAWB status/body on any failure so the user sees the exact cause.
+- Extra guard: some FAWB responses embed `SQLIntegrityConstraint` / `SQLSyntaxError` markers inside a 2xx body — that's still a failure, and the controller flips the response to a failure payload so the client doesn't misreport success.
+
+### Design decisions worth calling out
+- **No PK stripping.** If the current row's PK is an identity value, the INSERT will collide — the DB rejects, the user sees the error, they edit the PK cell and retry. Simpler than second-guessing which columns to omit and safer for tables with assigned (non-identity) PKs.
+- **Column set = whatever the SELECT returned.** If the SELECT was `SELECT id, name FROM T`, the INSERT will have exactly those two columns. Missing NOT NULL columns produce a DB error the user can read.
+- **Aliased columns will fail.** `SELECT id AS foo FROM T` produces a row keyed by `foo` — the INSERT will try to write to `foo`. DB errors, user sees the error, adjusts the query.
+
+### How to test
+1. Rebuild + reload.
+2. Run e.g. `SELECT * FROM DomainValue LIMIT 5` against sandbox.
+3. Click the `Code` cell of any row. Modal opens with `Code`'s value in an editable textarea.
+4. Change the value, click **Insert row**. Watch server logs — you'll see the emitted `INSERT INTO …`. Toast confirms.
+5. Try inserting with the original PK unchanged → expect a duplicate-key error rendered inline; grid unchanged.
+
+---
+
+## [0.1.0-SNAPSHOT] — Virtual FKs get a distinct color across all views — 2026-09-23
+
+### Fix
+Virtual FKs and real FKs looked identical wherever the FK marker was shown, so users couldn't tell at a glance which columns were hard-declared vs profile-configured. Added a consistent warning-tinted treatment throughout — same visual language everywhere the FK concept surfaces.
+
+### Added
+- **`--color-warning-soft`** CSS variable (light + dark theme), paired with the existing `--color-warning`. Amber 100 in light, translucent amber in dark.
+- **`.badge-warning`** — companion to `.badge-muted` / `.badge-danger`. Amber pill for anything that's "user-configured, not schema-declared".
+
+### Changed
+- **DB Explorer → Columns table**: virtual FK cell renders `[FK*] → Target` in warning color (real FKs stay `[FK] → Target` in the standard muted style). Column-name cell's dotted-underline tooltip hint uses `--color-warning` for virtual FKs. Tooltip text now leads with "Virtual foreign key" vs "Foreign key" and appends "user-configured on profile".
+- **DB Explorer → Relations table**: the "virtual" badge switches from muted grey to warning-tinted; the target link on virtual relations also renders in warning color for consistency with the Columns table.
+- **SQL Runner → right-click "Jump to referenced row"**: virtual FK entries render in warning color with a small warning-tinted "virtual" tag appended. Reveals the flag through `outgoingFks()`, which now carries `virtual: boolean` forward from the augmented dataModel.
+
+### Rationale
+Chose amber over red because virtual FKs aren't errors — they're a valid user configuration. Amber = "look here, this isn't the default" without alarming. Same color used everywhere so the mental mapping is one thing to learn, not three.
+
+---
+
+## [0.1.0-SNAPSHOT] — SQL Runner dataModel cache invalidation on profile save — 2026-09-23
+
+### Fix
+Virtual FKs added via the profile editor didn't appear in SQL Runner's right-click "Jump to referenced row" menu until the whole page was refreshed. Root cause: `ensureDataModelLoaded` short-circuits on unchanged profile ID, so edits to the *same* profile were invisible — the cache held pre-edit relations.
+
+### Changed
+- **`sql-runner.js`** — module-level `window.addEventListener('profile-changed', invalidateDataModelState)`. The event already fires on every profile save/create/activate; SQL Runner just wasn't listening. On the next `ensureDataModelLoaded` call the FK graph rebuilds from the server, picking up the overlaid virtual FKs.
+- **`VirtualFkOverlay.apply`** — added INFO log ("overlaid N synthetic relation(s) across M source table(s)") so you can confirm in server logs that the overlay is firing. DEBUG log when the profile has no virtual FKs; INFO if entries exist but all were skipped as malformed.
+
+### How to verify
+1. Rebuild + reload the page.
+2. Open SQL Runner. In server logs, watch for `VirtualFkOverlay: overlaid …` lines as tables are fetched.
+3. Right-click a row on a table with a virtual FK column → confirm the target appears under "Jump to referenced row".
+4. Bounce to Profiles, add another virtual FK, save. Come back to SQL Runner without refreshing → run a query → right-click → new entry should appear (cache was invalidated by the `profile-changed` event).
+
+---
+
+## [0.1.0-SNAPSHOT] — Virtual FKs get full FK parity in all views — 2026-09-23
+
+### Fix
+Virtual foreign keys already worked at import time (via `FkGraph` synthetic edges) but were invisible to every UI view — SQL Runner's right-click "Jump to referenced row" only listed real FKs, DB Explorer's Columns table showed no target for virtual-FK columns, and the ERD skipped their edges. User asked: virtual FKs should get *all* the rights a real FK gets.
+
+### Approach
+Server-side overlay in the dataModel-serving endpoints. A new `VirtualFkOverlay` utility rebuilds each affected `DataModel.Table` with the profile's `virtualForeignKeys` projected as synthetic `ManyToOne` relations (marked `virtual=true`). Since every frontend consumer reads FK info from `relations` on the returned dataModel — same shape, same rendering code — they *all* pick up virtual FKs with no client-side changes.
+
+Real-FK-wins guard: if a column is already an FK source on the source table, no synthetic relation is emitted for it. Malformed entries (unknown source/target table, missing column) are skipped silently.
+
+### Added
+- **`apps/VirtualFkOverlay.java`** — static `apply(DataModel, List<VirtualForeignKey>)` returns a new `DataModel` with synthetic relations grafted on. Non-destructive (original object untouched). Emits relations with `name="_devbridgeVirtualFk_<column>"` for traceability in debug dumps.
+
+### Changed
+- **`DataModelController.tableDetail`** — loads profile, applies overlay, then looks up the requested table. SQL Runner's `ensureDataModelLoaded` fetches every table via this endpoint, so `outgoingFks()` and the reverse-FK index automatically include virtual FKs. Jump-to-referenced-row entries now appear for virtual-FK columns; the referenced target is queried and shown just like for a real FK.
+- **`DataModelController.graph`** — overlay applied before building ERD nodes/edges. Virtual FKs appear as edges (styled the same as any other relation, cardinality `ManyToOne`, `virtual=true`).
+
+### What lights up for free (no code change)
+- **DB Explorer → Columns table** — the FK cell and column-name tooltip added yesterday work verbatim on virtual FKs (the FK-target lookup is derived from the same augmented `relations`). Virtual FKs render with a "virtual" badge next to the target link.
+- **DB Explorer → Relations table** — lists virtual FKs as ordinary relations with the "virtual" flag set; already-existing badge logic labels them.
+- **SQL Runner → "Find rows referencing this"** (reverse FK lookup) — also picks up incoming virtual FKs since `dataModelState.reverseFks` is built from the same augmented data.
+
+### Not changed
+- The runtime import path (`FkGraph.from(DataModel, List<VirtualForeignKey>)`) is independent of the overlay — it already injects virtual edges for the execution graph. Two injection points, one purpose: overlay serves the UI, `FkGraph` serves the executor.
+
+---
+
+## [0.1.0-SNAPSHOT] — DB Explorer: FK targets visible on the columns table — 2026-09-23
+
+### Fix
+DB Explorer's Columns table showed a plain `FK` badge with no indication of *which* table the column pointed at. Users had to scroll to the Relations section and cross-reference by column name to find out. The information is already in the loaded table detail (`relations[*].targetTable` + `mappings[*].sourceColumn`) — it just wasn't wired through.
+
+### Changed
+- `renderDetail` in `db-explorer.js` now pre-builds a `sourceColumn (lowercase) → { targetTable, targetColumn, cardinality, virtual }` lookup by scanning ManyToOne/OneToOne relations before rendering columns.
+- **FK cell** in the Columns table: replaces the static `FK` badge with an inline clickable link — `[FK] → TargetTable` — that opens the target table on click (reuses the existing `.dbe-target-link` handler). Hover tooltip shows the target column + cardinality (+ "virtual" for virtual relations). Virtual FKs get a small `virtual` badge next to the link.
+- **Column-name cell**: FK columns get a dotted underline and a hover tooltip with the same target info — so users can discover the target from either the column name or the FK badge, whichever they hover first.
+- Fallback: a column with `foreignKey=true` but no matching relation (defensive; shouldn't happen in a well-formed dataModel) still renders the plain badge — no crash, no silent misrouting.
+
+### Not changed
+- The separate Relations section stays exactly as it was (composite FK mappings, cascade, virtual flag).
+- No backend change — everything is a client-side derivation from the existing `/api/profiles/{id}/data-model/tables/{name}` payload.
+
+---
+
+## [0.1.0-SNAPSHOT] — Virtual foreign keys (non-FK columns holding reference ids) — 2026-09-23
+
+### Fix
+User-reported bug: some columns hold a `DomainValue.id` (or another reference-table id) but are **not** declared as FKs in the dataModel. The remap engine walks the FK graph, so these columns were invisible to it — the source id got inserted as-is into the target env. FAWB's app-submit validator enforces the domain-value constraint from metadata (not from a DB FK) and rejected the row with "domain value not found" errors.
+
+Root cause: `ReferenceRemapService.collectDirectRefs` and `ReferenceConfigDetector.collectCandidates` both iterate `FkGraph.parents(appTable)`. Anything not in the graph is a blind pass-through.
+
+### Approach
+A generic `Table.Column -> RefTable` mapping the user configures on the profile. At plan time each entry becomes a **synthetic edge** in `FkGraph` — from that point every downstream consumer (candidate detector, natural-key remap, executor FK substitution) treats it identically to a real FK. Real edges always win: if the dataModel already declares an FK on `(sourceTable, sourceColumn)`, the virtual entry is silently ignored.
+
+Kept generic (`RefTable` is user-set, not hard-coded to `DomainValue`) so future non-FK domain-shaped columns pointing at other reference tables (`Locale`, `Permission`, etc.) work with no code change.
+
+### Added
+- **`VirtualForeignKey` record** (`profile/VirtualForeignKey.java`) — `{sourceTable, sourceColumn, targetTable}`. Persisted as `virtualForeignKeys` on `ProjectProfile`. Backward-compatible via existing `@JsonIgnoreProperties(ignoreUnknown = true)` — older profile JSONs load with a null list.
+- **`FkGraph.from(DataModel, List<VirtualForeignKey>)` overload** — appends synthetic edges after real ones with `(childTable, fkColumn)` dedup. Skips (with a warn log) entries pointing at an unknown source table, unknown target table, or a column that doesn't exist on the source table. Emits an INFO line summarising injected/skipped counts.
+- **`VirtualFkSuggester` service** — name-heuristic scan of the dataModel. Flags integer columns whose name (or `*Id` variant) matches suffixes {Status, Type, Category, Code, Kind, Reason, Flag}, that are NOT already FKs, NOT PKs, and NOT audit columns. Defaults each suggestion's target to `DomainValue`; the UI lets the user override before saving.
+- **`GET /api/profiles/{id}/virtual-fk-suggestions`** — invokes the suggester against the profile's cached dataModel. Returns 404 when the dataModel isn't uploaded yet.
+- **Profile UI** — new "Virtual foreign keys" section (edit mode only) with a multi-line textarea (format: `Table.Column -> RefTable` per line) and a "Suggest candidates" button that renders a checklist with per-row target-table override. Selected suggestions append to the textarea; user saves to persist.
+
+### Changed
+- **`AppSqlFetchService`** now passes `profile.virtualForeignKeys()` through to `FkGraph.from`, so every plan/execute path picks up synthetic edges automatically. No other caller of `FkGraph.from` needed updating — there is only one.
+- **`ProfileController` constructor** now takes `DataModelService` + `VirtualFkSuggester` to serve the suggestions endpoint. Spring's constructor injection handles the wiring; no `@Autowired` needed.
+
+### How to test against real FAWB
+1. Edit an existing profile in the UI. The **Virtual foreign keys** section is now visible below Reference / setup tables.
+2. Click **Suggest candidates** — a checklist appears; keep the ones that look like domain-value holders, edit targets if the default `DomainValue` is wrong, click **Add selected**.
+3. Save the profile. Import the app that was failing on submit. Server log should show `virtualForeignKeys: injected N synthetic edge(s)…` and the plan's FK-remap section should include the newly configured columns.
+4. Submit the app in local — the domain-value validation error should be gone.
+
+### Notes
+- The `targetTable` should also be listed in **Reference / setup tables** (`referenceTables`), otherwise the walker will try to walk into it during the fetch. `DomainValue` is typically already there.
+- If the target's natural key isn't discoverable by `ReferenceConfigDetector` (no unique index and no Code/Name/Description-shaped column), you'll get a `no natural key discoverable` WARN and remap falls back to pass-through. Add an explicit `referenceTableConfigs` entry to fix.
+- Suggestions are name-heuristic only — they don't probe source data. Expect false positives on columns whose name looks domain-ish but stores something else (e.g. a raw code that's identical in both envs). The user is the filter.
+
+---
+
 ## [0.1.0-SNAPSHOT] — Bundled parent+child JSON insert path (CASE_DATUM finally works) — 2026-08-31
 
 ### Root cause we're accepting we can't fix at the CSV layer

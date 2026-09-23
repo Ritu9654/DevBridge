@@ -12,6 +12,7 @@ import {
     deleteDataModel,
     exportProfilesToJson,
     importProfilesFromJson,
+    getVirtualFkSuggestions,
 } from '../api.js';
 
 const FIELDS = [
@@ -126,6 +127,26 @@ export const profilesView = {
                                   placeholder="DomainValue, Locale, Permission"></textarea>
                     </div>
 
+                    <div class="form-section" id="virtual-fk-section" hidden>
+                        <hr class="form-divider">
+                        <div class="form-section-title">
+                            <h4>Virtual foreign keys <span class="hint-inline">(non-FK columns holding reference ids)</span></h4>
+                            <button type="button" class="btn ghost btn-sm" id="btn-suggest-vfks">Suggest candidates</button>
+                        </div>
+                        <p class="form-help">
+                            One entry per line, format: <code>Table.Column -&gt; RefTable</code>. Use this for columns
+                            that logically hold ids from a reference table (usually <code>DomainValue</code>) but are
+                            <strong>not</strong> declared as FKs in the dataModel — DevBridge treats them exactly like
+                            real FKs at import time, remapping source ids to target ids. Fixes "domain value not found"
+                            validation errors on submit in the local env. Requires the dataModel to be uploaded first;
+                            the target table should also appear in Reference / setup tables above.
+                        </p>
+                        <textarea id="field-virtualForeignKeys" name="virtualForeignKeys" class="json-overrides-input"
+                                  rows="3" spellcheck="false"
+                                  placeholder="Application.StatusId -> DomainValue&#10;CasePayload.ReasonCode -> DomainValue"></textarea>
+                        <div id="vfk-suggestions-panel" class="vfk-suggestions-panel" hidden></div>
+                    </div>
+
                     <div class="form-actions">
                         <button type="submit" class="btn" id="btn-submit">Save profile</button>
                         <button type="button" class="btn secondary" id="btn-cancel-add">Cancel</button>
@@ -168,6 +189,12 @@ export const profilesView = {
                 (window.showToast || alert)('Remove failed: ' + err.message, 'error');
             }
         });
+
+        // Suggest candidates for virtualForeignKeys (name-heuristic scan of dataModel)
+        document.getElementById('btn-suggest-vfks').addEventListener('click', async (e) => {
+            if (!editingProfileId) return;
+            await handleSuggestVirtualFks(editingProfileId, e.currentTarget);
+        });
     },
 };
 
@@ -207,6 +234,17 @@ async function onSubmit(e) {
         delete data.referenceTables;
     }
 
+    // virtualForeignKeys — one entry per line/comma, format "Table.Column -> RefTable".
+    // Silently drops malformed lines rather than blocking save; the profile stays saveable
+    // even if the user is mid-edit. Bad lines are logged to console for visibility.
+    if (data.virtualForeignKeys) {
+        const parsed = parseVirtualForeignKeys(String(data.virtualForeignKeys));
+        if (parsed.length === 0) delete data.virtualForeignKeys;
+        else data.virtualForeignKeys = parsed;
+    } else {
+        delete data.virtualForeignKeys;
+    }
+
     try {
         if (editingProfileId) {
             await updateProfile(editingProfileId, data);
@@ -233,6 +271,11 @@ function resetFormMode() {
     // Hide dataModel section — only visible when editing an existing profile
     const dmSection = document.getElementById('datamodel-section');
     if (dmSection) dmSection.hidden = true;
+    // Hide virtualForeignKeys section — dataModel-driven suggestions only make sense when editing
+    const vfkSection = document.getElementById('virtual-fk-section');
+    if (vfkSection) vfkSection.hidden = true;
+    const vfkPanel = document.getElementById('vfk-suggestions-panel');
+    if (vfkPanel) { vfkPanel.hidden = true; vfkPanel.innerHTML = ''; }
 }
 
 function startEdit(profile) {
@@ -249,6 +292,12 @@ function startEdit(profile) {
             ? profile.referenceTables.join(', ')
             : '';
     }
+    // virtualForeignKeys is stored as an array of {sourceTable, sourceColumn, targetTable} —
+    // render as one "Table.Column -> RefTable" line per entry
+    const vfkInput = form.querySelector('[name="virtualForeignKeys"]');
+    if (vfkInput) {
+        vfkInput.value = renderVirtualForeignKeys(profile.virtualForeignKeys);
+    }
     document.getElementById('form-title').textContent = `Edit profile — ${profile.name || '(unnamed)'}`;
     document.getElementById('btn-submit').textContent = 'Save changes';
 
@@ -256,6 +305,12 @@ function startEdit(profile) {
     const dmSection = document.getElementById('datamodel-section');
     if (dmSection) dmSection.hidden = false;
     refreshFormDataModel(profile.id).catch(() => {});
+
+    // Reveal virtualForeignKeys section (edit-only) and clear any prior suggestions panel
+    const vfkSection = document.getElementById('virtual-fk-section');
+    if (vfkSection) vfkSection.hidden = false;
+    const vfkPanel = document.getElementById('vfk-suggestions-panel');
+    if (vfkPanel) { vfkPanel.hidden = true; vfkPanel.innerHTML = ''; }
 
     const wrap = document.getElementById('add-form-wrapper');
     wrap.classList.remove('hidden');
@@ -589,6 +644,124 @@ function showTestResults(card, results) {
         </div>
     `;
     card.insertAdjacentHTML('beforeend', html);
+}
+
+/* ---------- Virtual foreign keys ---------- */
+
+/**
+ * Parse the textarea contents into a list of {sourceTable, sourceColumn, targetTable}.
+ * Format per entry: "Table.Column -> RefTable". Entries can be separated by newlines
+ * or commas. Malformed entries are dropped silently (console warn) so a mid-edit save
+ * doesn't fail — the user sees the reduced set the next time they open the form.
+ */
+function parseVirtualForeignKeys(text) {
+    const out = [];
+    if (!text) return out;
+    const rawEntries = String(text).split(/[,\n]/).map(s => s.trim()).filter(Boolean);
+    for (const entry of rawEntries) {
+        const m = entry.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:->|→)\s*([A-Za-z_][A-Za-z0-9_]*)$/);
+        if (!m) {
+            console.warn('virtualForeignKeys: dropping malformed entry:', entry);
+            continue;
+        }
+        out.push({ sourceTable: m[1], sourceColumn: m[2], targetTable: m[3] });
+    }
+    return out;
+}
+
+function renderVirtualForeignKeys(arr) {
+    if (!Array.isArray(arr) || arr.length === 0) return '';
+    return arr
+        .filter(v => v && v.sourceTable && v.sourceColumn && v.targetTable)
+        .map(v => `${v.sourceTable}.${v.sourceColumn} -> ${v.targetTable}`)
+        .join('\n');
+}
+
+async function handleSuggestVirtualFks(profileId, btn) {
+    const panel = document.getElementById('vfk-suggestions-panel');
+    if (!panel) return;
+    const originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = 'Loading…';
+    try {
+        const suggestions = await getVirtualFkSuggestions(profileId);
+        renderVfkSuggestionsPanel(panel, suggestions || []);
+    } catch (err) {
+        panel.hidden = false;
+        panel.innerHTML = `<p class="form-help vfk-suggestions-error">Could not load suggestions: ${escapeHtml(err.message || String(err))}. Make sure the dataModel is uploaded.</p>`;
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+    }
+}
+
+function renderVfkSuggestionsPanel(panel, suggestions) {
+    // Filter out entries already present in the textarea so the user only sees NEW candidates.
+    const textarea = document.getElementById('field-virtualForeignKeys');
+    const existing = new Set(parseVirtualForeignKeys(textarea ? textarea.value : '')
+        .map(v => `${v.sourceTable.toLowerCase()}.${v.sourceColumn.toLowerCase()}`));
+    const fresh = suggestions.filter(s =>
+        !existing.has(`${(s.sourceTable || '').toLowerCase()}.${(s.sourceColumn || '').toLowerCase()}`));
+
+    if (fresh.length === 0) {
+        panel.hidden = false;
+        panel.innerHTML = `<p class="form-help">No new candidates — the name-heuristic scan didn't find any columns to suggest, or all matches are already listed above.</p>`;
+        return;
+    }
+
+    const rows = fresh.map((s, i) => `
+        <label class="vfk-suggestion-row">
+            <input type="checkbox" data-vfk-idx="${i}" checked>
+            <code class="vfk-suggestion-col">${escapeHtml(s.sourceTable)}.${escapeHtml(s.sourceColumn)}</code>
+            <span class="vfk-suggestion-arrow">→</span>
+            <input type="text" class="vfk-suggestion-target" data-vfk-idx="${i}"
+                   value="${escapeHtml(s.suggestedTarget || 'DomainValue')}"
+                   spellcheck="false">
+        </label>
+    `).join('');
+
+    panel.hidden = false;
+    panel.innerHTML = `
+        <div class="vfk-suggestions-header">
+            <strong>${fresh.length}</strong> candidate${fresh.length === 1 ? '' : 's'} — untick any you don't want, edit the target table if needed, then add.
+        </div>
+        <div class="vfk-suggestions-list">${rows}</div>
+        <div class="vfk-suggestions-actions">
+            <button type="button" class="btn btn-sm" id="btn-vfk-add-selected">Add selected</button>
+            <button type="button" class="btn ghost btn-sm" id="btn-vfk-dismiss">Dismiss</button>
+        </div>
+    `;
+
+    panel.querySelector('#btn-vfk-add-selected').addEventListener('click', () => {
+        const rowsEls = panel.querySelectorAll('input[type="checkbox"][data-vfk-idx]');
+        const toAdd = [];
+        rowsEls.forEach(cb => {
+            if (!cb.checked) return;
+            const idx = Number(cb.dataset.vfkIdx);
+            const s = fresh[idx];
+            const targetInput = panel.querySelector(`input.vfk-suggestion-target[data-vfk-idx="${idx}"]`);
+            const target = targetInput ? targetInput.value.trim() : '';
+            if (!target) return;
+            toAdd.push({ sourceTable: s.sourceTable, sourceColumn: s.sourceColumn, targetTable: target });
+        });
+        if (toAdd.length === 0) {
+            (window.showToast || alert)('Nothing selected.', 'info');
+            return;
+        }
+        const currentText = textarea ? textarea.value.trim() : '';
+        const appended = toAdd.map(v => `${v.sourceTable}.${v.sourceColumn} -> ${v.targetTable}`).join('\n');
+        if (textarea) {
+            textarea.value = currentText ? `${currentText}\n${appended}` : appended;
+        }
+        panel.hidden = true;
+        panel.innerHTML = '';
+        (window.showToast || alert)(`Added ${toAdd.length} entr${toAdd.length === 1 ? 'y' : 'ies'}. Click Save changes to persist.`, 'success');
+    });
+
+    panel.querySelector('#btn-vfk-dismiss').addEventListener('click', () => {
+        panel.hidden = true;
+        panel.innerHTML = '';
+    });
 }
 
 /* ---------- Helpers ---------- */

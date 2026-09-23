@@ -1,6 +1,9 @@
 package com.devbridge.apps;
 
 import com.devbridge.datamodel.DataModel;
+import com.devbridge.profile.VirtualForeignKey;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.ArrayDeque;
@@ -31,6 +34,8 @@ import java.util.Set;
  */
 public final class FkGraph {
 
+    private static final Logger log = LoggerFactory.getLogger(FkGraph.class);
+
     /** An FK edge from a child table to a parent table. */
     public record Edge(String parentTable, String childTable,
                        String fkColumn, String parentPkColumn) {}
@@ -49,6 +54,21 @@ public final class FkGraph {
 
     /** Build the graph from a dataModel. Ignores views. */
     public static FkGraph from(DataModel model) {
+        return from(model, null);
+    }
+
+    /**
+     * Build the graph from a dataModel AND inject synthetic edges for the
+     * profile's {@link VirtualForeignKey} entries. Synthetic edges are
+     * appended AFTER real ones, and are dedup'd against real edges on the
+     * same {@code (childTable, fkColumn)} pair — if the dataModel already
+     * declares an FK on that column, the virtual entry is silently ignored
+     * (real wins). Entries pointing at unknown tables, or with a source
+     * column not present on the source table, are logged and skipped.
+     *
+     * <p>See {@link VirtualForeignKey} for why this exists.
+     */
+    public static FkGraph from(DataModel model, List<VirtualForeignKey> virtualForeignKeys) {
         Map<String, DataModel.Table> byName = new LinkedHashMap<>();
         Map<String, List<Edge>> byParent = new LinkedHashMap<>();
         Map<String, List<Edge>> byChild = new LinkedHashMap<>();
@@ -82,7 +102,93 @@ public final class FkGraph {
                 }
             }
         }
+        injectVirtualEdges(virtualForeignKeys, byName, byParent, byChild);
         return new FkGraph(byName, byParent, byChild);
+    }
+
+    /**
+     * Append virtual-FK edges to the graph. Real edges have already been
+     * emitted; anything that would collide on {@code (childTable, fkColumn)}
+     * is skipped so real declarations always win.
+     */
+    private static void injectVirtualEdges(List<VirtualForeignKey> virtualForeignKeys,
+                                           Map<String, DataModel.Table> byName,
+                                           Map<String, List<Edge>> byParent,
+                                           Map<String, List<Edge>> byChild) {
+        if (virtualForeignKeys == null || virtualForeignKeys.isEmpty()) return;
+        int injected = 0;
+        int skipped = 0;
+        for (VirtualForeignKey v : virtualForeignKeys) {
+            if (v == null) continue;
+            if (v.sourceTable() == null || v.sourceTable().isBlank()
+                    || v.sourceColumn() == null || v.sourceColumn().isBlank()
+                    || v.targetTable() == null || v.targetTable().isBlank()) {
+                log.warn("virtualForeignKeys: skipping incomplete entry {}", v);
+                skipped++;
+                continue;
+            }
+            String child = norm(v.sourceTable());
+            String parent = norm(v.targetTable());
+            DataModel.Table childTable = byName.get(child);
+            DataModel.Table parentTable = byName.get(parent);
+            if (childTable == null) {
+                log.warn("virtualForeignKeys: unknown source table '{}' — skipping", v.sourceTable());
+                skipped++;
+                continue;
+            }
+            if (parentTable == null) {
+                log.warn("virtualForeignKeys: unknown target table '{}' (from {}.{}) — skipping",
+                        v.targetTable(), v.sourceTable(), v.sourceColumn());
+                skipped++;
+                continue;
+            }
+            if (!columnExists(childTable, v.sourceColumn())) {
+                log.warn("virtualForeignKeys: column '{}' not found on table '{}' — skipping",
+                        v.sourceColumn(), v.sourceTable());
+                skipped++;
+                continue;
+            }
+            String colLower = v.sourceColumn().toLowerCase(Locale.ROOT);
+            boolean alreadyDeclared = false;
+            for (Edge existing : byChild.getOrDefault(child, List.of())) {
+                if (existing.fkColumn() != null
+                        && existing.fkColumn().toLowerCase(Locale.ROOT).equals(colLower)) {
+                    alreadyDeclared = true;
+                    break;
+                }
+            }
+            if (alreadyDeclared) {
+                log.info("virtualForeignKeys: {}.{} already has a real FK — real wins, virtual skipped",
+                        v.sourceTable(), v.sourceColumn());
+                skipped++;
+                continue;
+            }
+            String targetPk = firstPk(parentTable);
+            Edge edge = new Edge(parent, child, v.sourceColumn(),
+                    targetPk != null ? targetPk : "id");
+            byParent.computeIfAbsent(parent, k -> new ArrayList<>()).add(edge);
+            byChild.computeIfAbsent(child, k -> new ArrayList<>()).add(edge);
+            injected++;
+        }
+        if (injected > 0 || skipped > 0) {
+            log.info("virtualForeignKeys: injected {} synthetic edge(s), skipped {}", injected, skipped);
+        }
+    }
+
+    private static boolean columnExists(DataModel.Table table, String column) {
+        if (table == null || column == null || table.columns() == null) return false;
+        String colLower = column.toLowerCase(Locale.ROOT);
+        for (DataModel.Column c : table.columns()) {
+            if (c != null && c.name() != null
+                    && c.name().toLowerCase(Locale.ROOT).equals(colLower)) return true;
+        }
+        return false;
+    }
+
+    private static String firstPk(DataModel.Table t) {
+        if (t == null || t.primaryKey() == null || t.primaryKey().columns() == null) return null;
+        List<String> cols = t.primaryKey().columns();
+        return cols.isEmpty() ? null : cols.get(0);
     }
 
     /** Tables that FK into the given parent (i.e., its dependent tables). */

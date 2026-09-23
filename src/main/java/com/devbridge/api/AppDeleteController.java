@@ -88,7 +88,7 @@ public class AppDeleteController {
             FetchResult fetch = fetchService.fetch(
                     p.profile, DELETE_ENV, p.dataModel,
                     p.profile.rootTableName(), filterCol,
-                    req.appId().trim(), p.profile.referenceTables(),
+                    req.appId().trim(), java.util.List.of(),
                     /*scanOrphans=*/ true);
             DeletePlan plan = planService.build(fetch, p.profile, DELETE_ENV, req.appId().trim());
             return ResponseEntity.ok(plan);
@@ -124,7 +124,7 @@ public class AppDeleteController {
             FetchResult fetch = fetchService.fetch(
                     p.profile, DELETE_ENV, p.dataModel,
                     p.profile.rootTableName(), filterCol,
-                    req.appId().trim(), p.profile.referenceTables(),
+                    req.appId().trim(), java.util.List.of(),
                     /*scanOrphans=*/ true);
             DeleteJournal journal = executorService.execute(
                     fetch, p.profile, DELETE_ENV, req.appId().trim());

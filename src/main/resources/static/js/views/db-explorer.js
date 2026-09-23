@@ -253,6 +253,28 @@ function renderDetail(t) {
     const columns = Array.isArray(t.columns) ? t.columns : [];
     const relations = Array.isArray(t.relations) ? t.relations : [];
 
+    // Build a lookup: lowercase source-column-name → FK-target info. Only
+    // ManyToOne / OneToOne relations produce a real FK from this table's side.
+    // A composite FK (rare) will map multiple columns to the same relation;
+    // each column-level entry still resolves to its own targetColumn.
+    const fkTargetByColumn = {};
+    for (const r of relations) {
+        if (!r || !r.targetTable) continue;
+        const card = (r.cardinality || '').toLowerCase();
+        if (card !== 'manytoone' && card !== 'onetoone') continue;
+        const mappings = Array.isArray(r.mappings) ? r.mappings : [];
+        for (const m of mappings) {
+            if (!m || !m.sourceColumn) continue;
+            fkTargetByColumn[m.sourceColumn.toLowerCase()] = {
+                targetTable: r.targetTable,
+                targetColumn: m.targetColumn || 'id',
+                cardinality: r.cardinality || '',
+                virtual: !!r.virtual,
+                relationName: r.name || '',
+            };
+        }
+    }
+
     return `
         <div class="dbe-detail-head">
             <h3>${escapeHtml(t.entityName || '(no entity)')}</h3>
@@ -289,21 +311,23 @@ function renderDetail(t) {
                             </tr>
                         </thead>
                         <tbody>
-                            ${columns.map(c => `
+                            ${columns.map(c => {
+                                const fkTgt = c.name ? fkTargetByColumn[c.name.toLowerCase()] : null;
+                                return `
                                 <tr>
-                                    <td><code>${escapeHtml(c.name || '')}</code></td>
+                                    <td>${renderColumnNameCell(c, fkTgt)}</td>
                                     <td>${escapeHtml(c.fieldName || '')}</td>
                                     <td>${escapeHtml(c.sqlType || '')}</td>
                                     <td class="muted">${escapeHtml(c.javaType || '')}</td>
                                     <td>${boolBadge(c.nullable)}</td>
                                     <td>${c.primaryKey ? '<span class="badge">PK</span>' : ''}</td>
-                                    <td>${c.foreignKey ? '<span class="badge badge-muted">FK</span>' : ''}</td>
+                                    <td>${renderFkCell(c, fkTgt)}</td>
                                     <td class="muted">${escapeHtml(c.generatorType || '')}</td>
                                     <td>${boolBadge(c.columnValue && c.columnValue.insertable)}</td>
                                     <td>${boolBadge(c.columnValue && c.columnValue.updatable)}</td>
                                     <td>${maskLabel(c.mask)}</td>
                                 </tr>
-                            `).join('')}
+                            `;}).join('')}
                         </tbody>
                     </table>
                 </div>
@@ -323,12 +347,12 @@ function renderDetail(t) {
                         </thead>
                         <tbody>
                             ${relations.map(r => `
-                                <tr>
+                                <tr class="${r.virtual ? 'dbe-rel-row-virtual' : ''}">
                                     <td>${escapeHtml(r.name || '')}</td>
                                     <td><span class="badge badge-muted">${escapeHtml(r.cardinality || '')}</span></td>
                                     <td>${escapeHtml(r.fieldName || '')}</td>
                                     <td>
-                                        <button class="dbe-target-link" type="button"
+                                        <button class="dbe-target-link${r.virtual ? ' dbe-fk-link-virtual' : ''}" type="button"
                                                 data-target="${escapeHtml(r.targetTable || '')}"
                                                 title="Open ${escapeHtml(r.targetTable || '')}">
                                             <code>${escapeHtml(r.targetTable || '')}</code>
@@ -336,7 +360,7 @@ function renderDetail(t) {
                                     </td>
                                     <td class="muted">${renderMappings(r.mappings)}</td>
                                     <td>${boolBadge(r.cascadeEnabled)}</td>
-                                    <td>${r.virtual ? '<span class="badge badge-muted">virtual</span>' : ''}</td>
+                                    <td>${r.virtual ? '<span class="badge badge-warning">virtual</span>' : ''}</td>
                                 </tr>
                             `).join('')}
                         </tbody>
@@ -361,6 +385,45 @@ function renderMappings(mappings) {
     return mappings.map(m =>
         `<code>${escapeHtml(m.sourceColumn || '')}</code> → <code>${escapeHtml(m.targetColumn || '')}</code>`
     ).join('<br>');
+}
+
+/**
+ * Column-name cell. When the column is an FK, attach a hover tooltip
+ * describing the target. Virtual FKs get a warning-colored dotted underline
+ * so they're visually distinct from real FKs at a glance.
+ */
+function renderColumnNameCell(c, fkTgt) {
+    const name = c.name || '';
+    if (!fkTgt) return `<code>${escapeHtml(name)}</code>`;
+    const tip = fkTooltipText(fkTgt);
+    const cls = fkTgt.virtual ? 'dbe-col-fk dbe-col-fk-virtual' : 'dbe-col-fk';
+    return `<code class="${cls}" title="${escapeHtml(tip)}">${escapeHtml(name)}</code>`;
+}
+
+/**
+ * FK cell. Just the color-coded badge — no target text or click-through,
+ * because the Relations table below already lists the target (and clicking
+ * through from there is the intended navigation). Real FKs get the muted
+ * badge; virtual FKs get the warning-tinted `[FK*]` badge for a distinct
+ * at-a-glance signal. The column-name cell's hover tooltip still surfaces
+ * the target for anyone who wants it without leaving the row.
+ */
+function renderFkCell(c, fkTgt) {
+    if (!c.foreignKey && !fkTgt) return '';
+    if (!fkTgt) return '<span class="badge badge-muted">FK</span>';
+    const tip = fkTooltipText(fkTgt);
+    const isVirtual = !!fkTgt.virtual;
+    const badgeClass = isVirtual ? 'badge badge-warning' : 'badge badge-muted';
+    const badgeText = isVirtual ? 'FK*' : 'FK';
+    return `<span class="${badgeClass}" title="${escapeHtml(tip)}">${badgeText}</span>`;
+}
+
+function fkTooltipText(fkTgt) {
+    const kind = fkTgt.virtual ? 'Virtual foreign key' : 'Foreign key';
+    const parts = [`${kind} → ${fkTgt.targetTable}(${fkTgt.targetColumn})`];
+    if (fkTgt.cardinality) parts.push(fkTgt.cardinality);
+    if (fkTgt.virtual) parts.push('user-configured on profile');
+    return parts.join(' · ');
 }
 
 /* ---------------- Tab 2: ERD ---------------- */

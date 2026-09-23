@@ -18,7 +18,7 @@ import java.util.Set;
 /**
  * Builds a {@link DeletePlan} from an env-side {@link FetchResult}. Reverses the
  * topological FK order so children (leaves) are deleted before parents (roots).
- * Reference tables are skipped — they are shared data and never in the delete plan.
+ * All FK-dependent tables are included — no referenceTables filter — so FK constraints are always satisfied.
  *
  * <p>Pure computation — no network I/O.
  */
@@ -45,7 +45,6 @@ public class AppDeletePlanService {
         for (String w : fetch.warnings()) builder.warn(w);
 
         FkGraph graph = fetch.graph();
-        Set<String> refSet = normaliseReferences(profile.referenceTables());
         Set<String> orphanTables = fetch.orphanTables() != null ? fetch.orphanTables() : Collections.emptySet();
 
         List<String> subset = new ArrayList<>(fetch.rowsByTable().keySet());
@@ -88,7 +87,6 @@ public class AppDeletePlanService {
             if (rows == null || rows.isEmpty()) continue;
             DataModel.Table table = graph.table(tableName).orElse(null);
             if (table == null) continue;
-            if (refSet.contains(FkGraph.norm(tableName))) continue;
 
             String pkColumn = firstPkColumn(table);
             String samplePreview;
@@ -144,13 +142,6 @@ public class AppDeletePlanService {
             if (e.getKey() != null && e.getKey().toLowerCase(Locale.ROOT).equals(lower)) return e.getValue();
         }
         return null;
-    }
-
-    private static Set<String> normaliseReferences(List<String> configured) {
-        Set<String> out = new HashSet<>();
-        if (configured == null) return out;
-        for (String s : configured) if (s != null && !s.isBlank()) out.add(FkGraph.norm(s.trim()));
-        return out;
     }
 
     private static String firstNonBlank(String a, String b) {

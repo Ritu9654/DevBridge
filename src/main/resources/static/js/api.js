@@ -179,6 +179,43 @@ export async function executeSql({ env, sql }) {
     };
 }
 
+/**
+ * Update a single cell of a single row. Same non-throwing pattern as
+ * {@link executeSql} so the caller sees the structured error body (SQL that
+ * was attempted, FAWB status, FAWB body) rather than a generic thrown Error.
+ *
+ * @param {object}  args
+ * @param {string}  args.env        "sandbox" or "design"
+ * @param {string}  args.table      physical table name
+ * @param {string}  args.column     column to update
+ * @param {*}       args.newValue   value to write (null → SQL NULL)
+ * @param {object}  args.pk         {pkCol1: pkVal1, ...} — every PK column required
+ */
+export async function updateCell({ env, table, column, newValue, pk }) {
+    const res = await fetch(`${BASE}/sql/update-cell`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ env, table, column, newValue, pk }),
+    });
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* leave null */ }
+
+    if (res.ok) {
+        return parsed || { success: true, status: res.status };
+    }
+    if (parsed && typeof parsed === 'object') {
+        if (parsed.success !== false) parsed.success = false;
+        if (parsed.status == null) parsed.status = res.status;
+        return parsed;
+    }
+    return {
+        success: false,
+        status: res.status,
+        error: text || `${res.status} ${res.statusText}`,
+    };
+}
+
 /* App import (Module 2) — SQL-driven FK-graph walk */
 export function planImport({ appId, lookupColumn, sourceEnv, targetEnv } = {}) {
     const body = {};
@@ -285,4 +322,7 @@ export function getDataModelTable(profileId, tableName) {
 }
 export function getDataModelGraph(profileId) {
     return request(`/profiles/${encodeURIComponent(profileId)}/data-model/graph`);
+}
+export function getVirtualFkSuggestions(profileId) {
+    return request(`/profiles/${encodeURIComponent(profileId)}/virtual-fk-suggestions`);
 }

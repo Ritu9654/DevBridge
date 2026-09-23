@@ -325,8 +325,14 @@ public class ReferenceRemapService {
                 String refTable = entry.getKey();
                 Set<Object> ids = entry.getValue();
                 Map<Object, Map<String, Object>> already = cache.computeIfAbsent(refTable, k -> new LinkedHashMap<>());
+                // Normalise to String for the already-seen check: JSON may return Integer/Long
+                // while the FK value in the app row was a String (or vice-versa). A strict
+                // equals-based containsKey miss causes the same IDs to be re-fetched on every
+                // fixed-point iteration, turning O(N) HTTP calls into O(N²).
+                Set<String> alreadyNorm = new HashSet<>();
+                for (Object k : already.keySet()) alreadyNorm.add(String.valueOf(k));
                 Set<Object> missing = new LinkedHashSet<>();
-                for (Object id : ids) if (!already.containsKey(id)) missing.add(id);
+                for (Object id : ids) if (!alreadyNorm.contains(String.valueOf(id))) missing.add(id);
                 if (missing.isEmpty()) continue;
 
                 ReferenceTableConfig cfg = configs.get(refTable);
